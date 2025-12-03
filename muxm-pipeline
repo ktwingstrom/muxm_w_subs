@@ -25,6 +25,15 @@ ADD_FORMAT_TAG="${ADD_FORMAT_TAG:-1}"        # Add codec info to filename
 DELETE_ORIGINAL="${DELETE_ORIGINAL:-0}"      # Set to 1 to enable (dangerous!)
 VERIFY_OUTPUT="${VERIFY_OUTPUT:-1}"          # Verify before deleting original
 
+# Filebot integration (optional)
+USE_FILEBOT="${USE_FILEBOT:-0}"              # Enable filebot renaming
+FILEBOT_DB="${FILEBOT_DB:-TheMovieDB::TV}"   # Default: TV shows from TMDB
+FILEBOT_FORMAT="${FILEBOT_FORMAT:-}"         # Custom format string (empty = use default)
+FILEBOT_ACTION="${FILEBOT_ACTION:-move}"     # move, copy, hardlink, symlink
+FILEBOT_CONFLICT="${FILEBOT_CONFLICT:-auto}" # skip, override, auto, index, fail
+FILEBOT_LANG="${FILEBOT_LANG:-en}"           # Language for metadata
+FILEBOT_BIN=""                               # Filebot binary path (auto-detected)
+
 DRY_RUN=0
 VERBOSE=0
 
@@ -74,6 +83,13 @@ Output Options:
   --delete-original     Delete source after successful conversion
   --no-delete-original  Keep source files (default, safe)
 
+Filebot Renaming (optional):
+  --filebot             Enable filebot for proper media naming
+  --filebot-db DB       Database: TheMovieDB, TheMovieDB::TV, TheTVDB, etc.
+  --filebot-format FMT  Custom format string (overrides default)
+  --filebot-action ACT  move, copy, hardlink, symlink (default: move)
+  --filebot-lang LANG   Metadata language (default: en)
+
 Other:
   --dry-run             Show what would be processed
   -v, --verbose         Verbose output
@@ -91,6 +107,12 @@ Examples:
 
   # Custom cache location
   muxm-pipeline -c /mnt/nvme/cache /srv/plex-storage/Movies
+
+  # Use filebot for TV show naming (requires filebot installed)
+  muxm-pipeline --filebot --filebot-db TheMovieDB::TV /srv/plex-storage/TV
+
+  # Use filebot for movies
+  muxm-pipeline --filebot --filebot-db TheMovieDB /srv/plex-storage/Movies
 
 Cache Strategy:
   - Files copied to local NVMe before processing
@@ -119,6 +141,11 @@ while [[ $# -gt 0 ]]; do
     --no-delete-original) DELETE_ORIGINAL=0; shift ;;
     --verify)           VERIFY_OUTPUT=1; shift ;;
     --no-verify)        VERIFY_OUTPUT=0; shift ;;
+    --filebot)          USE_FILEBOT=1; shift ;;
+    --filebot-db)       FILEBOT_DB="${2:-}"; shift 2 ;;
+    --filebot-format)   FILEBOT_FORMAT="${2:-}"; shift 2 ;;
+    --filebot-action)   FILEBOT_ACTION="${2:-}"; shift 2 ;;
+    --filebot-lang)     FILEBOT_LANG="${2:-}"; shift 2 ;;
     --dry-run)          DRY_RUN=1; shift ;;
     -v|--verbose)       VERBOSE=1; shift ;;
     -h|--help)          print_usage; exit 0 ;;
@@ -151,6 +178,121 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MUXM_BIN="$SCRIPT_DIR/muxm"
 [[ ! -x "$MUXM_BIN" ]] && MUXM_BIN="$(command -v muxm 2>/dev/null || true)"
 [[ ! -x "$MUXM_BIN" ]] && die "Cannot find muxm script"
+
+# ---------- Find filebot (optional) ----------
+find_filebot() {
+  # Check common locations
+  local candidates=(
+    "$(command -v filebot 2>/dev/null || true)"
+    "/usr/bin/filebot"
+    "/usr/local/bin/filebot"
+    "/opt/filebot/filebot"
+    "$HOME/.local/share/filebot/filebot"
+    "$HOME/bin/filebot"
+  )
+
+  for fb in "${candidates[@]}"; do
+    if [[ -n "$fb" && -x "$fb" ]]; then
+      echo "$fb"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Auto-detect filebot if enabled
+if (( USE_FILEBOT )); then
+  FILEBOT_BIN=$(find_filebot || true)
+  if [[ -z "$FILEBOT_BIN" ]]; then
+    warn "Filebot not found. Disabling filebot renaming."
+    warn "Install filebot: https://www.filebot.net/download.html"
+    USE_FILEBOT=0
+  else
+    note "Filebot found: $FILEBOT_BIN"
+  fi
+fi
+
+# ---------- Filebot Renaming ----------
+# Rename a file using filebot
+# Args: input_file output_dir
+# Returns: 0 on success, 1 on failure
+# On success, echoes the new filename to stdout
+filebot_rename() {
+  local input_file="$1"
+  local output_dir="$2"
+  local log_file="${3:-/dev/null}"
+
+  if [[ -z "$FILEBOT_BIN" || ! -x "$FILEBOT_BIN" ]]; then
+    # Filebot not available, just return the input filename
+    echo "$input_file"
+    return 0
+  fi
+
+  # Build filebot command
+  local fb_cmd=("$FILEBOT_BIN" -rename "$input_file")
+  fb_cmd+=(--db "$FILEBOT_DB")
+  fb_cmd+=(--action "$FILEBOT_ACTION")
+  fb_cmd+=(--conflict "$FILEBOT_CONFLICT")
+  fb_cmd+=(--lang "$FILEBOT_LANG")
+  fb_cmd+=(--output "$output_dir")
+
+  # Add format if specified
+  if [[ -n "$FILEBOT_FORMAT" ]]; then
+    fb_cmd+=(--format "$FILEBOT_FORMAT")
+  fi
+
+  # Add non-strict matching for better results
+  fb_cmd+=(--non-strict)
+
+  echo "Running: ${fb_cmd[*]}" >> "$log_file"
+
+  # Run filebot and capture output
+  local fb_output
+  if fb_output=$("${fb_cmd[@]}" 2>> "$log_file"); then
+    # Parse output to find the new filename
+    # Filebot outputs lines like: [MOVE] from [/path/to/old] to [/path/to/new]
+    local new_file
+    new_file=$(echo "$fb_output" | grep -oP '(?<=to \[)[^\]]+' | tail -1)
+    if [[ -n "$new_file" && -f "$new_file" ]]; then
+      echo "$new_file"
+      return 0
+    else
+      # Fallback: check if file still exists at original location
+      if [[ -f "$input_file" ]]; then
+        warn "Filebot ran but file not renamed. Using original." >> "$log_file"
+        echo "$input_file"
+        return 0
+      fi
+    fi
+  fi
+
+  # Failed - return original file if it still exists
+  if [[ -f "$input_file" ]]; then
+    echo "$input_file"
+    return 0
+  fi
+
+  return 1
+}
+
+# Get default filebot format based on content type
+get_default_filebot_format() {
+  local db="$1"
+  case "$db" in
+    *TV*|*tvdb*|*thetvdb*)
+      # TV show format: Show Name/Season XX/Show Name - S01E02 - Episode Title.ext
+      echo '{plex.tail}'
+      ;;
+    *movie*|*Movie*)
+      # Movie format: Movie Name (Year)/Movie Name (Year).ext
+      echo '{plex.tail}'
+      ;;
+    *)
+      # Default to Plex naming
+      echo '{plex.tail}'
+      ;;
+  esac
+}
 
 # ---------- Cache Management ----------
 get_cache_usage_gb() {
@@ -338,6 +480,23 @@ process_single_file() {
     return 1
   fi
 
+  # Filebot renaming (optional)
+  local final_path="$dst_final"
+  if (( USE_FILEBOT )); then
+    echo "Running filebot for proper naming..." >> "$log_file"
+    local fb_result
+    if fb_result=$(filebot_rename "$dst_final" "$dst_nfs_dir" "$log_file"); then
+      if [[ -n "$fb_result" && -f "$fb_result" ]]; then
+        final_path="$fb_result"
+        echo "Filebot renamed to: $final_path" >> "$log_file"
+      else
+        echo "Filebot: kept original name" >> "$log_file"
+      fi
+    else
+      echo "Filebot rename failed, keeping original name" >> "$log_file"
+    fi
+  fi
+
   # Delete original if requested
   if (( DELETE_ORIGINAL )); then
     echo "Deleting original: $src_nfs" >> "$log_file"
@@ -347,7 +506,7 @@ process_single_file() {
   # Cleanup cache
   cleanup_cache_file "$basename"
 
-  echo "SUCCESS: $dst_name" >> "$log_file"
+  echo "SUCCESS: ${final_path##*/}" >> "$log_file"
   return 0
 }
 
@@ -361,6 +520,11 @@ say "Workers:     $MAX_WORKERS"
 say "Prefetch:    $PREFETCH_COUNT"
 say "Format Tag:  $(( ADD_FORMAT_TAG )) "
 say "Delete Orig: $(( DELETE_ORIGINAL )) ($(( DELETE_ORIGINAL )) && echo 'ENABLED!' || echo 'disabled')"
+if (( USE_FILEBOT )); then
+  say "Filebot:     ENABLED (db=$FILEBOT_DB)"
+else
+  say "Filebot:     disabled"
+fi
 echo ""
 
 # Safety warning
