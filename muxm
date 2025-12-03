@@ -1055,12 +1055,148 @@ resolve_audio_track_index() {
   echo 0
 }
 
+# ---------- Subtitle Selection Utilities ----------
+# Hardened helpers for subtitle detection and selection.
+# Handles null/missing metadata gracefully.
+
+# Count subtitle streams
+_subtitle_count() {
+  local n
+  n="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams s \
+        -show_entries stream=index -of csv=p=0 "$SRC_ABS" 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [[ -n "$n" ]] || n=0
+  echo "$n"
+}
+
+# List 0..N-1 subtitle indices
+list_subtitle_indices() {
+  local n i
+  n="$(_subtitle_count)"
+  for (( i=0; i<n; i++ )); do echo "$i"; done
+}
+
+# Safe field getter for subtitles (first line only, handle null/N/A)
+_sp_subtitle_field() { # $1=idx, $2=field
+  local out=""
+  out="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams "s:$1" \
+         -show_entries "stream=$2" -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null || true)"
+  out="${out%%$'\n'*}"  # First line only
+  [[ -z "$out" || "$out" == "null" || "$out" == "N/A" ]] && out=""
+  printf '%s' "$out"
+}
+
+# Safe tag getter for subtitles (first line only, handle null/N/A)
+_sp_subtitle_tag() { # $1=idx, $2=tag
+  local out=""
+  out="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams "s:$1" \
+         -show_entries "stream_tags=$2" -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null || true)"
+  out="${out%%$'\n'*}"  # First line only
+  [[ -z "$out" || "$out" == "null" || "$out" == "N/A" ]] && out=""
+  printf '%s' "$out"
+}
+
+# Check if subtitle is text-based (can convert to mov_text)
+is_text_subtitle() {
+  local codec="$1"
+  codec="$(printf '%s' "$codec" | tr '[:upper:]' '[:lower:]')"
+  case "$codec" in
+    subrip|srt|ass|ssa|mov_text|webvtt|text) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Check if subtitle is image-based (should be stripped)
+is_image_subtitle() {
+  local codec="$1"
+  codec="$(printf '%s' "$codec" | tr '[:upper:]' '[:lower:]')"
+  case "$codec" in
+    hdmv_pgs_subtitle|pgs|dvd_subtitle|dvdsub|dvb_subtitle|dvbsub|xsub) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Human-readable subtitle description
+describe_subtitle_stream() {
+  local i="$1" codec lang title forced
+  codec="$(_sp_subtitle_field "$i" codec_name)"
+  [[ -z "$codec" ]] && codec="unknown"
+  lang="$(_sp_subtitle_tag "$i" language)"
+  [[ -z "$lang" ]] && lang="und"
+  title="$(_sp_subtitle_tag "$i" title)"
+  forced="$(_sp_subtitle_field "$i" disposition)"
+  local forced_flag=""
+  [[ "$forced" == *"forced"* ]] && forced_flag=" [FORCED]"
+  printf "#%s: %s [%s]%s%s\n" "$i" "$codec" "$lang" "${title:+ — $title}" "$forced_flag"
+}
+
+# Select best English text subtitle, returns index or empty string if none
+select_english_subtitle() {
+  local sub_count best_idx="" best_score=-1
+  sub_count="$(_subtitle_count)"
+  (( sub_count == 0 )) && { echo ""; return; }
+
+  local i codec lang forced disp_forced
+  for (( i=0; i<sub_count; i++ )); do
+    codec="$(_sp_subtitle_field "$i" codec_name)"
+    [[ -z "$codec" ]] && continue
+
+    # Skip image-based subtitles
+    if is_image_subtitle "$codec"; then
+      continue
+    fi
+
+    # Must be text-based
+    if ! is_text_subtitle "$codec"; then
+      continue
+    fi
+
+    lang="$(_sp_subtitle_tag "$i" language)"
+    lang="$(printf '%s' "$lang" | tr '[:upper:]' '[:lower:]')"
+
+    # Check if English (eng, en, english, und treated as potentially english)
+    local is_english=0
+    case "$lang" in
+      eng|en|english) is_english=1 ;;
+      und|"") is_english=1 ;;  # Undefined might be English
+    esac
+
+    (( is_english == 0 )) && continue
+
+    # Check if forced (prefer non-forced)
+    disp_forced="$(ffprobe "${FFPROBE_FLAGS[@]}" -select_streams "s:$i" \
+                   -show_entries stream_disposition=forced -of default=nk=1:nw=1 "$SRC_ABS" 2>/dev/null || true)"
+    local score=10  # Base score for English text sub
+    [[ "$disp_forced" == "1" ]] && score=5  # Lower score for forced subs
+    [[ "$lang" == "eng" || "$lang" == "en" ]] && (( score += 5 ))  # Prefer explicit English tag
+
+    if (( score > best_score )); then
+      best_score=$score
+      best_idx=$i
+    fi
+  done
+
+  echo "$best_idx"
+}
+
+# Convert subtitle to SRT format for mov_text embedding
+convert_subtitle_to_srt() {
+  local sub_idx="$1" out_file="$2"
+  if [[ -n "$THREADS" ]]; then
+    ffmpeg "${FFMPEG_FLAGS[@]}" -threads "$THREADS" -i "$SRC_ABS" -map "0:s:$sub_idx" \
+      -c:s srt "$out_file"
+  else
+    ffmpeg "${FFMPEG_FLAGS[@]}" -i "$SRC_ABS" -map "0:s:$sub_idx" \
+      -c:s srt "$out_file"
+  fi
+}
+
 # ---------- Temp Paths ----------
 V_ENCODED="$WORKDIR/video_encoded.mp4"
 V_FINAL=""  # Will be set to "passthrough" or path to encoded file
 A_PRIMARY=""
 AAC_STEREO=""
 SUB_MOV_TEXT=""
+SUB_SRT="$WORKDIR/subtitle.srt"
 MP4_BASE="$WORKDIR/primary_base.mp4"
 
 # ---------- Video Processing (Step [1/10]) ----------
@@ -1240,50 +1376,120 @@ else
   note "No audio tracks detected; continuing with video-only."
 fi
 
-# ---------- Primary MP4 Mux (video + primary audio) (Step [7/10]) ----------
-say "[7/10] Muxing primary MP4 → $MP4_BASE"
-if (( DRY_RUN )); then
-  say "DRY-RUN: MP4Box mux → $MP4_BASE"
-  : > "$MP4_BASE"
-else
-  _mp4box_quiet=(); (( MP4BOX_QUIET )) && _mp4box_quiet=(-quiet)
-  _title_arg=""
-  (( INCLUDE_AUDIO_TITLES )) && [[ -n "$A_TITLE" ]] && _title_arg=":name=$A_TITLE"
+# ---------- Subtitle Selection and Extraction (Step [6/10]) ----------
+say "[6/10] Subtitle selection…"
 
-  if [[ -s "$A_PRIMARY" ]]; then
-    # Try MP4Box first for consistent interleaving
-    if ! MP4Box "${_mp4box_quiet[@]}" -add "$V_MIXED" -add "$A_PRIMARY:lang=$A_LANG${_title_arg}" -inter "$MP4_INTERLEAVE_MS" -new "$MP4_BASE"; then
-      warn "MP4Box failed to import audio (codec/container support). Falling back to ffmpeg for mux."
-      # ffmpeg fallback mux (handles EC-3/AC-3-in-MP4 correctly)
-      ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
-        -i "$V_MIXED" -i "$A_PRIMARY" \
-        -map 0:v:0 -map 1:a:0 -c copy -movflags +faststart "$MP4_BASE"
+SUB_COUNT="$(_subtitle_count)"
+SUB_IDX=""
+HAS_SUBTITLE=0
+
+if (( SUB_COUNT == 0 )); then
+  note "No subtitle tracks found in source."
+else
+  note "Found $SUB_COUNT subtitle track(s):"
+  for (( _si=0; _si<SUB_COUNT; _si++ )); do
+    describe_subtitle_stream "$_si"
+  done
+
+  SUB_IDX="$(select_english_subtitle)"
+  if [[ -n "$SUB_IDX" ]]; then
+    _sub_codec="$(_sp_subtitle_field "$SUB_IDX" codec_name)"
+    _sub_lang="$(_sp_subtitle_tag "$SUB_IDX" language)"
+    [[ -z "$_sub_lang" ]] && _sub_lang="eng"
+    note "Selected subtitle track #$SUB_IDX ($_sub_codec, $_sub_lang) for embedding."
+
+    if (( DRY_RUN )); then
+      say "DRY-RUN: Extract subtitle #$SUB_IDX → $SUB_SRT"
+      : > "$SUB_SRT"
+    else
+      if convert_subtitle_to_srt "$SUB_IDX" "$SUB_SRT"; then
+        if [[ -s "$SUB_SRT" ]]; then
+          SUB_MOV_TEXT="$SUB_SRT"
+          HAS_SUBTITLE=1
+          mark_done "Subtitle extracted"
+        else
+          warn "Subtitle extraction produced empty file. Continuing without subtitles."
+        fi
+      else
+        warn "Failed to extract subtitle track #$SUB_IDX. Continuing without subtitles."
+      fi
     fi
   else
-    # Video-only
-    if ! MP4Box "${_mp4box_quiet[@]}" -add "$V_MIXED" -inter "$MP4_INTERLEAVE_MS" -new "$MP4_BASE"; then
-      ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
-        -i "$V_MIXED" -map 0:v:0 -c copy -movflags +faststart "$MP4_BASE"
-    fi
+    note "No English text subtitles found. All image-based/non-English subs will be stripped."
   fi
+fi
+
+# ---------- Primary MP4 Mux (video + primary audio + subtitle) (Step [7/10]) ----------
+say "[7/10] Muxing primary MP4 → $MP4_BASE"
+
+# Determine video source for muxing
+if [[ "$V_FINAL" == "passthrough" ]]; then
+  V_MUX_SRC="$SRC_ABS"
+  V_MUX_STREAM="0:v:0"
+else
+  V_MUX_SRC="$V_FINAL"
+  V_MUX_STREAM="0:v:0"
+fi
+
+if (( DRY_RUN )); then
+  say "DRY-RUN: ffmpeg mux → $MP4_BASE"
+  [[ -n "$SUB_MOV_TEXT" ]] && say "  (with subtitle from $SUB_MOV_TEXT)"
+  : > "$MP4_BASE"
+else
+  # Use ffmpeg for muxing to handle passthrough + subtitle embedding cleanly
+  _mux_inputs=( -i "$V_MUX_SRC" )
+  _mux_maps=( -map "$V_MUX_STREAM" )
+  _mux_codec=( -c:v copy )
+  _mux_meta=()
+
+  # Add audio if present
+  if [[ -s "$A_PRIMARY" ]]; then
+    _mux_inputs+=( -i "$A_PRIMARY" )
+    _mux_maps+=( -map 1:a:0 )
+    _mux_codec+=( -c:a copy )
+    _mux_meta+=( -metadata:s:a:0 language="$A_LANG" )
+    (( INCLUDE_AUDIO_TITLES )) && [[ -n "$A_TITLE" ]] && _mux_meta+=( -metadata:s:a:0 title="$A_TITLE" )
+    _sub_input_idx=2
+  else
+    _sub_input_idx=1
+  fi
+
+  # Add subtitle if present
+  if [[ -n "$SUB_MOV_TEXT" && -s "$SUB_MOV_TEXT" ]]; then
+    _mux_inputs+=( -i "$SUB_MOV_TEXT" )
+    _mux_maps+=( -map "${_sub_input_idx}:s:0" )
+    _mux_codec+=( -c:s mov_text )
+    _sub_lang="${_sub_lang:-eng}"
+    _mux_meta+=( -metadata:s:s:0 language="$_sub_lang" -metadata:s:s:0 title="English" )
+  fi
+
+  ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
+    "${_mux_inputs[@]}" \
+    "${_mux_maps[@]}" \
+    "${_mux_codec[@]}" \
+    "${_mux_meta[@]}" \
+    -movflags +faststart "$MP4_BASE"
+
+  [[ ! -s "$MP4_BASE" ]] && die 35 "Primary mux failed: $MP4_BASE not created or empty."
 fi
 mark_done "Mux primary"
 
-# ---------- Final Assembly (add stereo or copy base) (Step [8/10]) ----------
+# ---------- Final Assembly (add stereo fallback or copy base) (Step [8/10]) ----------
 say "[8/10] Assembling final MP4 → $TMP_OUT"
 if (( DRY_RUN )); then
   say "DRY-RUN: finalize → $TMP_OUT"
+  [[ -s "$AAC_STEREO" ]] && say "  (adding stereo fallback track)"
   : > "$TMP_OUT"
 else
-  _mp4box_quiet=(); (( MP4BOX_QUIET )) && _mp4box_quiet=(-quiet)
   if [[ -s "$AAC_STEREO" ]]; then
-    # Try MP4Box to append the stereo track with language + title
-    if ! MP4Box "${_mp4box_quiet[@]}" -add "$MP4_BASE" -add "$AAC_STEREO:name=Stereo:lang=$A_LANG" -inter "$MP4_INTERLEAVE_MS" -new "$TMP_OUT"; then
-      warn "MP4Box failed to append stereo track. Falling back to ffmpeg."
-      ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
-        -i "$MP4_BASE" -i "$AAC_STEREO" \
-        -map 0 -map 1:a:0 -c copy -movflags +faststart "$TMP_OUT"
-    fi
+    # Append stereo track using ffmpeg
+    ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
+      -i "$MP4_BASE" -i "$AAC_STEREO" \
+      -map 0 -map 1:a:0 \
+      -c copy \
+      -metadata:s:a:1 language="$A_LANG" \
+      -metadata:s:a:1 title="Stereo" \
+      -movflags +faststart "$TMP_OUT"
   else
     cp -f "$MP4_BASE" "$TMP_OUT"
   fi
