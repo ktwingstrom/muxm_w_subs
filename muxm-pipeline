@@ -1,0 +1,614 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  muxm-pipeline - High-performance batch processor with local caching
+#  Optimized for NFS sources with local NVMe processing
+# =============================================================================
+
+set -euo pipefail
+
+# ---------- Defaults ----------
+CACHE_DIR="${CACHE_DIR:-/var/cache/muxm}"
+CACHE_INPUT="$CACHE_DIR/input"
+CACHE_OUTPUT="$CACHE_DIR/output"
+CACHE_TEMP="$CACHE_DIR/temp"
+
+MAX_WORKERS="${MAX_WORKERS:-6}"
+PREFETCH_COUNT="${PREFETCH_COUNT:-3}"        # Files to prefetch ahead
+CACHE_MAX_GB="${CACHE_MAX_GB:-1800}"         # Max cache usage in GB
+RECURSIVE="${RECURSIVE:-1}"
+FILE_EXTENSIONS="${FILE_EXTENSIONS:-mkv,mp4,avi,mov,m4v,ts,wmv,webm,flv}"
+
+# Naming
+ADD_FORMAT_TAG="${ADD_FORMAT_TAG:-1}"        # Add codec info to filename
+
+# Safety
+DELETE_ORIGINAL="${DELETE_ORIGINAL:-0}"      # Set to 1 to enable (dangerous!)
+VERIFY_OUTPUT="${VERIFY_OUTPUT:-1}"          # Verify before deleting original
+
+# Filebot integration (optional)
+USE_FILEBOT="${USE_FILEBOT:-0}"              # Enable filebot renaming
+FILEBOT_DB="${FILEBOT_DB:-TheMovieDB::TV}"   # Default: TV shows from TMDB
+FILEBOT_FORMAT="${FILEBOT_FORMAT:-}"         # Custom format string (empty = use default)
+FILEBOT_ACTION="${FILEBOT_ACTION:-move}"     # move, copy, hardlink, symlink
+FILEBOT_CONFLICT="${FILEBOT_CONFLICT:-auto}" # skip, override, auto, index, fail
+FILEBOT_LANG="${FILEBOT_LANG:-en}"           # Language for metadata
+FILEBOT_BIN=""                               # Filebot binary path (auto-detected)
+
+DRY_RUN=0
+VERBOSE=0
+
+# ---------- Colors ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ---------- Helpers ----------
+say()  { echo -e "${BLUE}[pipeline]${NC} $*"; }
+note() { echo -e "${GREEN}[pipeline]${NC} $*"; }
+warn() { echo -e "${YELLOW}[pipeline]${NC} $*" >&2; }
+die()  { echo -e "${RED}[pipeline]${NC} $*" >&2; exit 1; }
+debug() { (( VERBOSE )) && echo -e "${CYAN}[debug]${NC} $*"; }
+
+# ---------- Usage ----------
+print_usage() {
+  cat <<EOF
+muxm-pipeline - High-performance batch processor with local caching
+
+Copies files from NFS to local NVMe cache, processes them, then moves
+back to NFS. Prefetches next files while processing for maximum throughput.
+
+Usage: muxm-pipeline [OPTIONS] INPUT_DIR [OUTPUT_DIR]
+
+Arguments:
+  INPUT_DIR             Source directory (typically NFS mount)
+  OUTPUT_DIR            Destination directory (default: INPUT_DIR, replaces originals)
+
+Cache Options:
+  -c, --cache-dir DIR   Cache directory (default: $CACHE_DIR)
+  --cache-max-gb N      Max cache usage in GB (default: $CACHE_MAX_GB)
+  --prefetch N          Files to prefetch ahead (default: $PREFETCH_COUNT)
+
+Processing Options:
+  -w, --workers N       Parallel muxm workers (default: $MAX_WORKERS)
+  -r, --recursive       Process subdirectories (default: on)
+  -R, --no-recursive    Only process INPUT_DIR
+  -e, --extensions LIST Comma-separated extensions (default: mkv,mp4,...)
+
+Output Options:
+  --format-tag          Add format info to filename (default: on)
+  --no-format-tag       Keep original filename (just change extension)
+  --delete-original     Delete source after successful conversion
+  --no-delete-original  Keep source files (default, safe)
+
+Filebot Renaming (optional):
+  --filebot             Enable filebot for proper media naming
+  --filebot-db DB       Database: TheMovieDB, TheMovieDB::TV, TheTVDB, etc.
+  --filebot-format FMT  Custom format string (overrides default)
+  --filebot-action ACT  move, copy, hardlink, symlink (default: move)
+  --filebot-lang LANG   Metadata language (default: en)
+
+Other:
+  --dry-run             Show what would be processed
+  -v, --verbose         Verbose output
+  -h, --help            Show this help
+
+Examples:
+  # Process movies, keep originals
+  muxm-pipeline /srv/plex-storage/Movies
+
+  # Process and replace originals (CAREFUL!)
+  muxm-pipeline --delete-original /srv/plex-storage/Movies
+
+  # Process TV shows with more workers
+  muxm-pipeline -w 8 /srv/plex-storage/TV
+
+  # Custom cache location
+  muxm-pipeline -c /mnt/nvme/cache /srv/plex-storage/Movies
+
+  # Use filebot for TV show naming (requires filebot installed)
+  muxm-pipeline --filebot --filebot-db TheMovieDB::TV /srv/plex-storage/TV
+
+  # Use filebot for movies
+  muxm-pipeline --filebot --filebot-db TheMovieDB /srv/plex-storage/Movies
+
+Cache Strategy:
+  - Files copied to local NVMe before processing
+  - Next $PREFETCH_COUNT files prefetched while current batch processes
+  - Output written locally, then moved to destination
+  - Cache cleaned after each file completes
+EOF
+}
+
+# ---------- Parse Arguments ----------
+INPUT_DIR=""
+OUTPUT_DIR=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--cache-dir)     CACHE_DIR="${2:-}"; shift 2 ;;
+    --cache-max-gb)     CACHE_MAX_GB="${2:-}"; shift 2 ;;
+    --prefetch)         PREFETCH_COUNT="${2:-}"; shift 2 ;;
+    -w|--workers)       MAX_WORKERS="${2:-}"; shift 2 ;;
+    -r|--recursive)     RECURSIVE=1; shift ;;
+    -R|--no-recursive)  RECURSIVE=0; shift ;;
+    -e|--extensions)    FILE_EXTENSIONS="${2:-}"; shift 2 ;;
+    --format-tag)       ADD_FORMAT_TAG=1; shift ;;
+    --no-format-tag)    ADD_FORMAT_TAG=0; shift ;;
+    --delete-original)  DELETE_ORIGINAL=1; shift ;;
+    --no-delete-original) DELETE_ORIGINAL=0; shift ;;
+    --verify)           VERIFY_OUTPUT=1; shift ;;
+    --no-verify)        VERIFY_OUTPUT=0; shift ;;
+    --filebot)          USE_FILEBOT=1; shift ;;
+    --filebot-db)       FILEBOT_DB="${2:-}"; shift 2 ;;
+    --filebot-format)   FILEBOT_FORMAT="${2:-}"; shift 2 ;;
+    --filebot-action)   FILEBOT_ACTION="${2:-}"; shift 2 ;;
+    --filebot-lang)     FILEBOT_LANG="${2:-}"; shift 2 ;;
+    --dry-run)          DRY_RUN=1; shift ;;
+    -v|--verbose)       VERBOSE=1; shift ;;
+    -h|--help)          print_usage; exit 0 ;;
+    -*)                 die "Unknown option: $1" ;;
+    *)
+      if [[ -z "$INPUT_DIR" ]]; then
+        INPUT_DIR="$1"
+      elif [[ -z "$OUTPUT_DIR" ]]; then
+        OUTPUT_DIR="$1"
+      else
+        die "Unexpected argument: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Validate
+[[ -z "$INPUT_DIR" ]] && { print_usage; die "INPUT_DIR is required"; }
+[[ ! -d "$INPUT_DIR" ]] && die "INPUT_DIR does not exist: $INPUT_DIR"
+[[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$INPUT_DIR"
+
+# Update cache paths
+CACHE_INPUT="$CACHE_DIR/input"
+CACHE_OUTPUT="$CACHE_DIR/output"
+CACHE_TEMP="$CACHE_DIR/temp"
+
+# ---------- Find muxm ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MUXM_BIN="$SCRIPT_DIR/muxm"
+[[ ! -x "$MUXM_BIN" ]] && MUXM_BIN="$(command -v muxm 2>/dev/null || true)"
+[[ ! -x "$MUXM_BIN" ]] && die "Cannot find muxm script"
+
+# ---------- Find filebot (optional) ----------
+find_filebot() {
+  # Check common locations
+  local candidates=(
+    "$(command -v filebot 2>/dev/null || true)"
+    "/usr/bin/filebot"
+    "/usr/local/bin/filebot"
+    "/opt/filebot/filebot"
+    "$HOME/.local/share/filebot/filebot"
+    "$HOME/bin/filebot"
+  )
+
+  for fb in "${candidates[@]}"; do
+    if [[ -n "$fb" && -x "$fb" ]]; then
+      echo "$fb"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Auto-detect filebot if enabled
+if (( USE_FILEBOT )); then
+  FILEBOT_BIN=$(find_filebot || true)
+  if [[ -z "$FILEBOT_BIN" ]]; then
+    warn "Filebot not found. Disabling filebot renaming."
+    warn "Install filebot: https://www.filebot.net/download.html"
+    USE_FILEBOT=0
+  else
+    note "Filebot found: $FILEBOT_BIN"
+  fi
+fi
+
+# ---------- Filebot Renaming ----------
+# Rename a file using filebot
+# Args: input_file output_dir
+# Returns: 0 on success, 1 on failure
+# On success, echoes the new filename to stdout
+filebot_rename() {
+  local input_file="$1"
+  local output_dir="$2"
+  local log_file="${3:-/dev/null}"
+
+  if [[ -z "$FILEBOT_BIN" || ! -x "$FILEBOT_BIN" ]]; then
+    # Filebot not available, just return the input filename
+    echo "$input_file"
+    return 0
+  fi
+
+  # Build filebot command
+  local fb_cmd=("$FILEBOT_BIN" -rename "$input_file")
+  fb_cmd+=(--db "$FILEBOT_DB")
+  fb_cmd+=(--action "$FILEBOT_ACTION")
+  fb_cmd+=(--conflict "$FILEBOT_CONFLICT")
+  fb_cmd+=(--lang "$FILEBOT_LANG")
+  fb_cmd+=(--output "$output_dir")
+
+  # Add format if specified
+  if [[ -n "$FILEBOT_FORMAT" ]]; then
+    fb_cmd+=(--format "$FILEBOT_FORMAT")
+  fi
+
+  # Add non-strict matching for better results
+  fb_cmd+=(--non-strict)
+
+  echo "Running: ${fb_cmd[*]}" >> "$log_file"
+
+  # Run filebot and capture output
+  local fb_output
+  if fb_output=$("${fb_cmd[@]}" 2>> "$log_file"); then
+    # Parse output to find the new filename
+    # Filebot outputs lines like: [MOVE] from [/path/to/old] to [/path/to/new]
+    local new_file
+    new_file=$(echo "$fb_output" | grep -oP '(?<=to \[)[^\]]+' | tail -1)
+    if [[ -n "$new_file" && -f "$new_file" ]]; then
+      echo "$new_file"
+      return 0
+    else
+      # Fallback: check if file still exists at original location
+      if [[ -f "$input_file" ]]; then
+        warn "Filebot ran but file not renamed. Using original." >> "$log_file"
+        echo "$input_file"
+        return 0
+      fi
+    fi
+  fi
+
+  # Failed - return original file if it still exists
+  if [[ -f "$input_file" ]]; then
+    echo "$input_file"
+    return 0
+  fi
+
+  return 1
+}
+
+# Get default filebot format based on content type
+get_default_filebot_format() {
+  local db="$1"
+  case "$db" in
+    *TV*|*tvdb*|*thetvdb*)
+      # TV show format: Show Name/Season XX/Show Name - S01E02 - Episode Title.ext
+      echo '{plex.tail}'
+      ;;
+    *movie*|*Movie*)
+      # Movie format: Movie Name (Year)/Movie Name (Year).ext
+      echo '{plex.tail}'
+      ;;
+    *)
+      # Default to Plex naming
+      echo '{plex.tail}'
+      ;;
+  esac
+}
+
+# ---------- Cache Management ----------
+get_cache_usage_gb() {
+  du -s "$CACHE_DIR" 2>/dev/null | awk '{print int($1/1024/1024)}'
+}
+
+wait_for_cache_space() {
+  local needed_gb="$1"
+  local max_wait=300  # 5 minutes max
+  local waited=0
+
+  while true; do
+    local used_gb=$(get_cache_usage_gb)
+    local available_gb=$((CACHE_MAX_GB - used_gb))
+
+    if (( available_gb >= needed_gb )); then
+      return 0
+    fi
+
+    if (( waited >= max_wait )); then
+      warn "Timeout waiting for cache space (need ${needed_gb}GB, have ${available_gb}GB)"
+      return 1
+    fi
+
+    debug "Waiting for cache space: need ${needed_gb}GB, available ${available_gb}GB"
+    sleep 5
+    ((waited += 5))
+  done
+}
+
+cleanup_cache_file() {
+  local basename="$1"
+  rm -f "$CACHE_INPUT/$basename" "$CACHE_OUTPUT/${basename%.*}.mp4" 2>/dev/null || true
+}
+
+# ---------- File Discovery ----------
+build_file_list() {
+  local find_cmd="find \"$INPUT_DIR\""
+  (( RECURSIVE == 0 )) && find_cmd+=" -maxdepth 1"
+  find_cmd+=" -type f \\("
+
+  local first=1
+  IFS=',' read -ra exts <<< "$FILE_EXTENSIONS"
+  for ext in "${exts[@]}"; do
+    ext="$(echo "$ext" | tr -d '[:space:]')"
+    (( first )) && first=0 || find_cmd+=" -o"
+    find_cmd+=" -iname \"*.$ext\""
+  done
+  find_cmd+=" \\)"
+
+  eval "$find_cmd" 2>/dev/null | sort
+}
+
+# ---------- Format Tag Generation ----------
+get_format_tag() {
+  local file="$1"
+  local vcodec acodec channels resolution
+
+  # Video codec
+  vcodec=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_name \
+           -of default=nk=1:nw=1 "$file" 2>/dev/null | head -1 | tr '[:lower:]' '[:upper:]')
+  case "$vcodec" in
+    H264|AVC)  vcodec="H264" ;;
+    HEVC|H265) vcodec="H265" ;;
+    *)         vcodec="H265" ;;  # We transcode to H265
+  esac
+
+  # Audio codec (will be AAC after processing)
+  acodec="AAC"
+
+  # Channels
+  channels=$(ffprobe -v quiet -select_streams a:0 -show_entries stream=channels \
+             -of default=nk=1:nw=1 "$file" 2>/dev/null | head -1)
+  case "$channels" in
+    8) channels="71" ;;
+    6) channels="51" ;;
+    2) channels="Stereo" ;;
+    *) channels="Stereo" ;;
+  esac
+
+  # Resolution
+  local height
+  height=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=height \
+           -of default=nk=1:nw=1 "$file" 2>/dev/null | head -1)
+  if [[ "$height" =~ ^[0-9]+$ ]]; then
+    if (( height >= 2000 )); then
+      resolution="2160p"
+    elif (( height >= 1000 )); then
+      resolution="1080p"
+    elif (( height >= 700 )); then
+      resolution="720p"
+    else
+      resolution="SD"
+    fi
+  else
+    resolution=""
+  fi
+
+  # Build tag
+  local tag="${resolution:+$resolution.}${vcodec}.${acodec}${channels}"
+  echo "$tag"
+}
+
+generate_output_name() {
+  local src_path="$1"
+  local basename="${src_path##*/}"
+  local name_no_ext="${basename%.*}"
+
+  if (( ADD_FORMAT_TAG )); then
+    local tag
+    tag=$(get_format_tag "$src_path")
+    # Remove existing format tags (common patterns)
+    name_no_ext=$(echo "$name_no_ext" | sed -E 's/\.(x264|x265|h264|h265|hevc|avc|aac|ac3|dts|truehd|atmos|51|71|stereo|1080p|720p|2160p|4k)+//gi')
+    name_no_ext=$(echo "$name_no_ext" | sed -E 's/\.+$//')  # Remove trailing dots
+    echo "${name_no_ext}.${tag}.mp4"
+  else
+    echo "${name_no_ext}.mp4"
+  fi
+}
+
+# ---------- Single File Processing ----------
+process_single_file() {
+  local src_nfs="$1"
+  local dst_nfs_dir="$2"
+  local log_file="$3"
+
+  local basename="${src_nfs##*/}"
+  local rel_path="${src_nfs#$INPUT_DIR/}"
+  local rel_dir="$(dirname "$rel_path")"
+  [[ "$rel_dir" == "." ]] && rel_dir=""
+
+  local src_cached="$CACHE_INPUT/$basename"
+  local dst_name=$(generate_output_name "$src_nfs")
+  local dst_cached="$CACHE_OUTPUT/$dst_name"
+  local dst_final="$dst_nfs_dir${rel_dir:+/$rel_dir}/$dst_name"
+
+  # Get file size for cache management
+  local file_size_gb
+  file_size_gb=$(du -s "$src_nfs" 2>/dev/null | awk '{print int($1/1024/1024 + 1)}')
+
+  echo "=== Processing: $rel_path ===" >> "$log_file"
+  echo "Source: $src_nfs" >> "$log_file"
+  echo "Size: ${file_size_gb}GB" >> "$log_file"
+
+  # Wait for cache space (need space for input + output, estimate 1.2x for output)
+  local needed_space=$((file_size_gb * 3))
+  if ! wait_for_cache_space "$needed_space"; then
+    echo "FAIL: Insufficient cache space" >> "$log_file"
+    return 1
+  fi
+
+  # Copy to cache
+  echo "Copying to cache..." >> "$log_file"
+  if ! cp "$src_nfs" "$src_cached" 2>> "$log_file"; then
+    echo "FAIL: Copy to cache failed" >> "$log_file"
+    cleanup_cache_file "$basename"
+    return 1
+  fi
+
+  # Process
+  echo "Processing with muxm..." >> "$log_file"
+  export TMPDIR="$CACHE_TEMP"
+  if ! "$MUXM_BIN" "$src_cached" "$dst_cached" >> "$log_file" 2>&1; then
+    echo "FAIL: muxm processing failed" >> "$log_file"
+    cleanup_cache_file "$basename"
+    return 1
+  fi
+
+  # Verify output
+  if (( VERIFY_OUTPUT )); then
+    echo "Verifying output..." >> "$log_file"
+    if ! ffprobe -v error "$dst_cached" >> "$log_file" 2>&1; then
+      echo "FAIL: Output verification failed" >> "$log_file"
+      cleanup_cache_file "$basename"
+      return 1
+    fi
+  fi
+
+  # Move to destination
+  echo "Moving to destination: $dst_final" >> "$log_file"
+  mkdir -p "$(dirname "$dst_final")"
+  if ! mv "$dst_cached" "$dst_final" 2>> "$log_file"; then
+    echo "FAIL: Move to destination failed" >> "$log_file"
+    cleanup_cache_file "$basename"
+    return 1
+  fi
+
+  # Filebot renaming (optional)
+  local final_path="$dst_final"
+  if (( USE_FILEBOT )); then
+    echo "Running filebot for proper naming..." >> "$log_file"
+    local fb_result
+    if fb_result=$(filebot_rename "$dst_final" "$dst_nfs_dir" "$log_file"); then
+      if [[ -n "$fb_result" && -f "$fb_result" ]]; then
+        final_path="$fb_result"
+        echo "Filebot renamed to: $final_path" >> "$log_file"
+      else
+        echo "Filebot: kept original name" >> "$log_file"
+      fi
+    else
+      echo "Filebot rename failed, keeping original name" >> "$log_file"
+    fi
+  fi
+
+  # Delete original if requested
+  if (( DELETE_ORIGINAL )); then
+    echo "Deleting original: $src_nfs" >> "$log_file"
+    rm -f "$src_nfs" 2>> "$log_file" || warn "Could not delete original: $src_nfs"
+  fi
+
+  # Cleanup cache
+  cleanup_cache_file "$basename"
+
+  echo "SUCCESS: ${final_path##*/}" >> "$log_file"
+  return 0
+}
+
+# ---------- Main ----------
+say "=== muxm-pipeline ==="
+say "Input:       $INPUT_DIR"
+say "Output:      $OUTPUT_DIR"
+say "Cache:       $CACHE_DIR"
+say "Max Cache:   ${CACHE_MAX_GB}GB"
+say "Workers:     $MAX_WORKERS"
+say "Prefetch:    $PREFETCH_COUNT"
+say "Format Tag:  $(( ADD_FORMAT_TAG )) "
+say "Delete Orig: $(( DELETE_ORIGINAL )) ($(( DELETE_ORIGINAL )) && echo 'ENABLED!' || echo 'disabled')"
+if (( USE_FILEBOT )); then
+  say "Filebot:     ENABLED (db=$FILEBOT_DB)"
+else
+  say "Filebot:     disabled"
+fi
+echo ""
+
+# Safety warning
+if (( DELETE_ORIGINAL )); then
+  warn "========================================"
+  warn "  DELETE_ORIGINAL is ENABLED!"
+  warn "  Source files will be DELETED after"
+  warn "  successful conversion."
+  warn "========================================"
+  echo ""
+  read -p "Continue? [y/N] " -n 1 -r
+  echo
+  [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+fi
+
+# Create cache directories
+mkdir -p "$CACHE_INPUT" "$CACHE_OUTPUT" "$CACHE_TEMP"
+
+# Create log directory
+LOG_DIR="$CACHE_DIR/logs"
+mkdir -p "$LOG_DIR"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+MAIN_LOG="$LOG_DIR/pipeline-$TIMESTAMP.log"
+FAILED_LOG="$LOG_DIR/failed-$TIMESTAMP.txt"
+SUCCESS_LOG="$LOG_DIR/success-$TIMESTAMP.txt"
+
+# Get file list
+say "Scanning for files..."
+FILE_LIST=$(build_file_list)
+TOTAL_FILES=$(echo "$FILE_LIST" | grep -c . || echo 0)
+say "Found $TOTAL_FILES files"
+echo ""
+
+if (( TOTAL_FILES == 0 )); then
+  note "No files to process."
+  exit 0
+fi
+
+if (( DRY_RUN )); then
+  say "DRY-RUN: Files that would be processed:"
+  echo "$FILE_LIST" | while read -r f; do
+    [[ -n "$f" ]] && echo "  $f -> $(generate_output_name "$f")"
+  done
+  exit 0
+fi
+
+# Process files
+PROCESSED=0
+SUCCEEDED=0
+FAILED=0
+
+# Simple sequential processing for now (parallel prefetch can be added later)
+while IFS= read -r src_file; do
+  [[ -z "$src_file" ]] && continue
+
+  ((PROCESSED++)) || true
+  rel_path="${src_file#$INPUT_DIR/}"
+  say "[$PROCESSED/$TOTAL_FILES] Processing: $rel_path"
+
+  log_file="$LOG_DIR/$(echo "$rel_path" | tr '/' '_' | tr ' ' '_').log"
+
+  if process_single_file "$src_file" "$OUTPUT_DIR" "$log_file"; then
+    ((SUCCEEDED++)) || true
+    echo "$src_file" >> "$SUCCESS_LOG"
+    note "  -> SUCCESS"
+  else
+    ((FAILED++)) || true
+    echo "$src_file" >> "$FAILED_LOG"
+    warn "  -> FAILED (see $log_file)"
+  fi
+
+done <<< "$FILE_LIST"
+
+# Summary
+echo ""
+say "=== Complete ==="
+note "Processed: $PROCESSED"
+note "Succeeded: $SUCCEEDED"
+note "Failed:    $FAILED"
+note "Logs:      $LOG_DIR"
+
+if [[ -s "$FAILED_LOG" ]]; then
+  warn "Some files failed. Check logs in $LOG_DIR"
+fi
+
+(( FAILED > 0 )) && exit 1
+exit 0
