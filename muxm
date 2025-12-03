@@ -941,7 +941,11 @@ _is_passthrough_codec() {
 # Check NVENC availability
 check_nvenc_available() {
   # Check for hevc_nvenc encoder support
-  if ! ffmpeg -encoders 2>&1 | grep -q "hevc_nvenc"; then
+  # Note: Must capture to variable first; direct pipe fails with pipefail due to
+  # some shells treating the pipe as failed even when both commands succeed
+  local encoders
+  encoders=$(ffmpeg -encoders 2>&1) || true
+  if ! echo "$encoders" | grep -q "hevc_nvenc"; then
     warn "NVENC not available. Falling back to libx265 (CPU)."
     USE_NVENC=0
     return 1
@@ -1241,14 +1245,14 @@ else
   elif (( USE_NVENC )); then
     # NVENC hardware encode
     note "Using NVENC hardware encoding (preset=$NVENC_PRESET, cq=$NVENC_CQ)"
-    local nvenc_pix="p010le"
-    [[ "$TARGET_PIXFMT" == "yuv420p" ]] && nvenc_pix="yuv420p"
+    _nvenc_pix="p010le"
+    [[ "$TARGET_PIXFMT" == "yuv420p" ]] && _nvenc_pix="yuv420p"
 
     ffmpeg "${FFMPEG_FLAGS[@]}" -hwaccel cuda -hwaccel_device "$NVENC_GPU_INDEX" \
       -i "$SRC_ABS" -map 0:v:0 \
       -c:v hevc_nvenc -preset "$NVENC_PRESET" -tune "$NVENC_TUNE" \
       -cq "$NVENC_CQ" -b:v 0 \
-      -pix_fmt "$nvenc_pix" \
+      -pix_fmt "$_nvenc_pix" \
       "${COLOR_ARGS[@]}" \
       -an "$V_ENCODED"
   else
