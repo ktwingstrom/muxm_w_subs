@@ -688,7 +688,7 @@ fi
 # ---------- Required tools (only needed for real work) ----------
 need ffmpeg
 need ffprobe
-need MP4Box
+# MP4Box no longer required - using ffmpeg for all muxing
 
 # ---------- Thread Auto-Detection ----------
 if [[ -z "$THREADS" ]] && (( AUTO_THREADS )); then
@@ -727,7 +727,8 @@ OUT_DIR="$(cd -- "$OUT_DIR" 2>/dev/null && pwd || echo "$OUT_DIR")"
 OUT_BASENAME="$(basename -- "$OUT")"
 OUT_ABS="${OUT_DIR}/${OUT_BASENAME}"
 OUT="$OUT_ABS"
-TMP_OUT="${OUT}.tmp"
+# Temp file keeps .mp4 extension so ffmpeg can auto-detect format
+TMP_OUT="${OUT_DIR}/.${OUT_BASENAME%.mp4}.tmp.mp4"
 
 # ---------- Build ffmpeg/ffprobe flags from effective settings ----------
 (( FFMPEG_HIDE_BANNER )) && FFMPEG_FLAGS+=(-hide_banner)
