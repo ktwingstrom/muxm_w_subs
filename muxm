@@ -47,8 +47,9 @@ FORCE_CHROMA_420=1
 SDR_USE_10BIT_IF_SRC_10BIT=1
 HDR_TARGET_PIXFMT="yuv420p10le"
 
-# Threads
+# Threads (auto-detect if empty)
 THREADS=""
+AUTO_THREADS=1  # Use nproc for auto-detection
 
 # Video passthrough / NVENC encoding
 VIDEO_PASSTHROUGH=0
@@ -225,7 +226,8 @@ ffmpeg/ffprobe UX:
       --ffprobe-loglevel LVL     Log level for ffprobe (default ${FFPROBE_LOGLEVEL})
 
 Threads:
-      --threads N                ffmpeg -threads N (empty = ffmpeg decides)
+      --threads N                ffmpeg -threads N (auto-detected by default)
+      --no-auto-threads          Disable auto-detection, let ffmpeg decide
 
 Video (x265):
   -p, --preset NAME              ultrafast..placebo (default ${PRESET_VALUE})
@@ -386,7 +388,8 @@ while [[ $# -gt 0 ]]; do
     --no-overwrite) FFMPEG_OVERWRITE=0; shift ;;
     --ffprobe-loglevel) FFPROBE_LOGLEVEL="${2:-}"; shift 2 ;;
 
-    --threads) THREADS="${2:-}"; shift 2 ;;
+    --threads) THREADS="${2:-}"; AUTO_THREADS=0; shift 2 ;;
+    --no-auto-threads) AUTO_THREADS=0; shift ;;
 
     -p|--preset) PRESET_VALUE="${2:-}"; is_valid_preset "$PRESET_VALUE" || die 11 "Invalid preset: $PRESET_VALUE"; shift 2 ;;
     --crf) CRF_VALUE="${2:-}"; shift 2 ;;
@@ -686,6 +689,23 @@ fi
 need ffmpeg
 need ffprobe
 need MP4Box
+
+# ---------- Thread Auto-Detection ----------
+if [[ -z "$THREADS" ]] && (( AUTO_THREADS )); then
+  if command -v nproc &>/dev/null; then
+    THREADS="$(nproc)"
+    note "Auto-detected $THREADS CPU threads."
+  elif [[ -f /proc/cpuinfo ]]; then
+    THREADS="$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 4)"
+    note "Auto-detected $THREADS CPU threads (from /proc/cpuinfo)."
+  elif command -v sysctl &>/dev/null; then
+    THREADS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+    note "Auto-detected $THREADS CPU threads (from sysctl)."
+  else
+    THREADS=4
+    note "Could not detect CPU threads. Using default: $THREADS"
+  fi
+fi
 
 # ---------- Inputs ----------
 FFMPEG_FLAGS=()
