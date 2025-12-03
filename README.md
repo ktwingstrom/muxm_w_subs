@@ -1,95 +1,167 @@
-# ![muxm](./assets/muxm_header_small.png) MuxMaster
+# MuxMaster (Simplified Fork)
 
-**MuxMaster** – a versatile, cross-platform video repacking and encoding utility that preserves HDR, Dolby Vision, and high-quality audio while optimizing for Plex and Apple TV Direct Play. Supports smart codec handling, color space matching, error recovery, and optional stereo fallback.
+**A fast video remuxing tool** focused on passthrough and minimal transcoding for large media libraries.
+
+This is a simplified fork of [MuxMaster](https://github.com/theBluWiz/muxmaster) optimized for:
+- **Video passthrough** for H.264/H.265 (no re-encoding)
+- **NVENC hardware encoding** for other codecs
+- **AAC audio** with stereo fallback
+- **English text subtitles** embedded as mov_text
+- **Batch processing** with parallel workers
 
 ## Table of Contents
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Examples](#examples)
-- [Going Forward](#goingforward)
+- [Batch Processing](#batch)
+- [Configuration](#config)
 - [License](#license)
-- [Contributing](#contributing)
-- [Author](#author)
 
+## Features <a id="features"></a>
 
-## ✨ Features <a id="features"></a>
-
-- **Preserves HDR & Dolby Vision** – Keeps original color depth and HDR metadata where possible
-- **Audio Preservation** – Retains E-AC-3, AC-3, or AAC without re-encoding; converts others to best Direct Play-compatible format
-- **Stereo Fallback** – Optionally creates a high-quality stereo track for compatibility
-- **Error Recovery** – Detects, logs, and gracefully handles mid-process failures
-- **Color Space Matching** – Matches output color space & depth to the source if not Dolby Vision
-- **Cross-Platform** – Works on macOS and most modern Linux distributions
+- **Video Passthrough** – H.264 and H.265 sources are copied without re-encoding
+- **NVENC Transcoding** – Other codecs (VP9, AV1, ProRes) transcoded via GPU
+- **AAC Audio** – All audio output as AAC (384k surround, 192k stereo fallback)
+- **Subtitle Extraction** – English text subtitles (SRT, ASS) embedded as mov_text
+- **Parallel Processing** – `muxm-batch` processes directories with multiple workers
+- **Auto Thread Detection** – Optimizes CPU usage automatically
+- **HDR Preservation** – Maintains HDR10/HLG metadata on passthrough
 - **Dry-Run Mode** – Test workflows without writing files
-- **Checksum Verification** – Ensures output integrity
-- **Clean-up on Failure** – Removes incomplete temp files when an error occurs
 
 ---
 
-## 📦 Installation <a id="installation"></a>
+## Installation <a id="installation"></a>
+
+### Dependencies
+
+```bash
+# Ubuntu/Debian
+sudo apt install ffmpeg gpac
+
+# For NVENC support, ensure nvidia drivers are installed
+# ffmpeg must be compiled with --enable-nvenc
+```
+
+### Install Script
 
 ```bash
 # Clone the repository
-git clone https://github.com/theBluWiz/muxmaster.git
-cd muxmaster
+git clone https://github.com/your-repo/muxmaster-fork.git
+cd muxmaster-fork
 
-# Make the script executable
-chmod +x muxm
+# Make scripts executable
+chmod +x muxm muxm-batch
 
-# Optionally move to a location in your PATH
-sudo mv muxm /usr/local/bin/muxm
+# Optionally add to PATH
+sudo ln -s "$(pwd)/muxm" /usr/local/bin/muxm
+sudo ln -s "$(pwd)/muxm-batch" /usr/local/bin/muxm-batch
 ```
 
-## 🚀 Usage <a id="usage"></a>
+## Usage <a id="usage"></a>
+
+### Single File
 
 ```bash
-muxm <source file> <target file>
-```
-### Arguments:
-- `<source file>` – Input media file (e.g., `movie.mkv`)
-- `<target file>` – Output file (e.g., `movie.mp4`)
-### Flags:
-- `--dry-run` – Simulate without writing output
-- `--parallelize` / `-p` – Encode audio in parallel
-
-## 🔍 Examples <a id="examples"></a>
-
-```bash
-# Standard encode, defaults to CRF 18 and 192k stereo fallback
+# Basic usage (passthrough H.264/H.265)
 muxm input.mkv output.mp4
 
-# Dry run for testing
+# Dry run
 muxm --dry-run input.mkv output.mp4
+
+# Force CPU encoding (disable NVENC)
+muxm --no-nvenc input.mkv output.mp4
+
+# Adjust NVENC quality
+muxm --nvenc-preset p6 --nvenc-cq 20 input.mkv output.mp4
 ```
 
-## Going Forward <a id="goingforward"></a>
--	Environment Configuration – Support local (.env.local) and global (.env) files to adjust constants, variables, and flags without editing the script.
--	Batch Directory Processing – Add logic to process all compatible files in a directory (including subdirectories) with filtering by extension or codec.
--	Parallel Processing Option – Allow multi-threaded encoding when hardware resources are available, with automatic core detection.
--	Codec Expansion – Broaden compatibility to include VP9, AV1, and ProRes workflows while preserving current Dolby Vision/HDR handling.
--	Format Presets – Introduce named presets for different targets (Apple TV, Plex, archival storage, YouTube).
--	Logging Enhancements – Support JSON log output for easier integration with monitoring systems or CI pipelines.
--	Interactive Mode – Add a guided CLI wizard for non-technical users to configure a job without needing full command-line knowledge.
--	Self-Update Mechanism – Include an update command to pull the latest release from GitHub automatically.
--	Custom Naming Templates – Allow users to define output filename patterns with variables (e.g., {title}_{codec}_{crf}).
--	Checksum Verification – Integrate optional hash verification of inputs and outputs for data integrity.
+### Key Flags
 
-## 📄 License <a id="license"></a>
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Simulate without writing output |
+| `--nvenc` / `--no-nvenc` | Enable/disable NVENC hardware encoding |
+| `--nvenc-preset p1-p7` | NVENC quality preset (default: p4) |
+| `--nvenc-cq 0-51` | NVENC constant quality (default: 23) |
+| `--aac-surround-5-1 RATE` | 5.1 AAC bitrate (default: 384k) |
+| `--aac-surround-7-1 RATE` | 7.1 AAC bitrate (default: 448k) |
+| `--stereo-bitrate RATE` | Stereo fallback bitrate (default: 192k) |
+| `--threads N` | Override thread count |
+
+## Batch Processing <a id="batch"></a>
+
+Process entire directories with parallel workers:
+
+```bash
+# Process all videos in a directory (6 workers)
+muxm-batch /media/movies
+
+# Output to different location
+muxm-batch /media/source /media/converted
+
+# Custom worker count
+muxm-batch -w 4 /media/movies
+
+# Only process MKV files
+muxm-batch -e mkv /media/movies
+
+# Dry run to preview
+muxm-batch --dry-run /media/movies
+
+# Retry failed files
+muxm-batch --retry ./muxm-batch-logs/failed.txt
+```
+
+### Batch Flags
+
+| Flag | Description |
+|------|-------------|
+| `-w, --workers N` | Parallel workers (default: 6) |
+| `-r, --recursive` | Process subdirectories (default: on) |
+| `-R, --no-recursive` | Only process top directory |
+| `-s, --skip-existing` | Skip if output exists (default: on) |
+| `-f, --force` | Overwrite existing outputs |
+| `-e, --extensions LIST` | File extensions (default: mkv,mp4,avi,...) |
+| `-l, --log-dir DIR` | Log directory |
+| `--retry FILE` | Retry from failed log |
+| `--dry-run` | List files without processing |
+
+### Worker Recommendations
+
+- **Tesla P4**: 2-3 concurrent NVENC sessions
+- **Passthrough jobs**: Mostly I/O bound, can run many
+- **Default 6 workers**: Balances GPU queue and parallelism
+
+## Configuration <a id="config"></a>
+
+Configuration files are loaded in order (later overrides earlier):
+
+1. `/etc/.muxmrc` – System-wide
+2. `~/.muxmrc` – User config
+3. `./.muxmrc` – Project-local
+4. CLI flags – Always highest priority
+
+### Example .muxmrc
+
+```bash
+# NVENC settings
+USE_NVENC=1
+NVENC_PRESET=p4
+NVENC_CQ=23
+
+# Audio
+AAC_SURROUND_BITRATE_5_1=384k
+AAC_SURROUND_BITRATE_7_1=448k
+STEREO_BITRATE=192k
+ADD_STEREO_IF_MULTICH=1
+
+# Threading
+AUTO_THREADS=1
+```
+
+## License <a id="license"></a>
 
 MuxMaster is freeware for personal, non-commercial use.
 Any business, government, or organizational use requires a paid license.
 
-Full license text available in [LICENSE.md](./LICENSE.md)
-
-## 🤝 Contributing <a id="contributing"></a>
-
-Contributions are welcome for bug reports, feature requests, and documentation improvements.
-Please note that all code changes must be approved by the maintainer and comply with the license.
-
-## 👤 Author <a id="author"></a>
-
-Maintainer: Jamey Wicklund (theBluWiz)  
-Email: [thebluwiz@thoughtspace.place](mailto:thebluwiz@thoughtspace.place)
-
-> **Tip:** If you are a hiring manager or recruiter, this project demonstrates advanced Bash scripting, media processing workflows, error handling, and cross-platform compatibility design.
+Based on [MuxMaster](https://github.com/theBluWiz/muxmaster) by Jamey Wicklund (theBluWiz).
