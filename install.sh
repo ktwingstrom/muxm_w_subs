@@ -112,7 +112,10 @@ check_nvidia_driver() {
 # Check if NVENC is available in ffmpeg
 check_nvenc() {
     if command -v ffmpeg &>/dev/null; then
-        if ffmpeg -encoders 2>&1 | grep -q "hevc_nvenc"; then
+        # Avoid SIGPIPE with pipefail by capturing output first
+        local encoders
+        encoders=$(ffmpeg -encoders 2>&1)
+        if echo "$encoders" | grep -q "hevc_nvenc"; then
             say "NVENC encoder available in ffmpeg"
             return 0
         fi
@@ -123,7 +126,9 @@ check_nvenc() {
 # Check if VAAPI is available (AMD/Intel)
 check_vaapi() {
     if command -v ffmpeg &>/dev/null; then
-        if ffmpeg -encoders 2>&1 | grep -q "hevc_vaapi"; then
+        local encoders
+        encoders=$(ffmpeg -encoders 2>&1)
+        if echo "$encoders" | grep -q "hevc_vaapi"; then
             say "VAAPI encoder available in ffmpeg"
             return 0
         fi
@@ -133,12 +138,18 @@ check_vaapi() {
 
 # Install base dependencies
 install_base_deps() {
-    say "Installing base dependencies (ffmpeg, ffprobe, MP4Box)..."
+    say "Installing base dependencies (ffmpeg, ffprobe)..."
 
     case "$PKG_MANAGER" in
         apt)
             $SUDO apt-get update
-            $SUDO apt-get install -y ffmpeg gpac pciutils
+            $SUDO apt-get install -y ffmpeg pciutils
+            # gpac/MP4Box is optional fallback - try both package names
+            if ! $SUDO apt-get install -y gpac 2>/dev/null; then
+                if ! $SUDO apt-get install -y gpac-tools 2>/dev/null; then
+                    warn "MP4Box (gpac) not available - skipping (optional fallback muxer)"
+                fi
+            fi
             ;;
         dnf)
             # Enable RPM Fusion for ffmpeg
@@ -148,10 +159,12 @@ install_base_deps() {
                     "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
                     "https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm"
             fi
-            $SUDO dnf install -y ffmpeg gpac pciutils
+            $SUDO dnf install -y ffmpeg pciutils
+            $SUDO dnf install -y gpac 2>/dev/null || warn "MP4Box (gpac) not available - skipping (optional)"
             ;;
         pacman)
-            $SUDO pacman -Sy --noconfirm ffmpeg gpac pciutils
+            $SUDO pacman -Sy --noconfirm ffmpeg pciutils
+            $SUDO pacman -Sy --noconfirm gpac 2>/dev/null || warn "MP4Box (gpac) not available - skipping (optional)"
             ;;
     esac
 
@@ -230,7 +243,7 @@ install_vaapi() {
 # Verify installation
 verify_install() {
     say "Verifying installation..."
-    local all_good=1
+    local errors=0
 
     # Check ffmpeg
     if command -v ffmpeg &>/dev/null; then
@@ -238,7 +251,7 @@ verify_install() {
         say "✓ ffmpeg: $FFMPEG_VERSION"
     else
         err "✗ ffmpeg not found"
-        all_good=0
+        errors=$((errors + 1))
     fi
 
     # Check ffprobe
@@ -246,7 +259,7 @@ verify_install() {
         say "✓ ffprobe: installed"
     else
         err "✗ ffprobe not found"
-        all_good=0
+        errors=$((errors + 1))
     fi
 
     # Check MP4Box
@@ -276,7 +289,7 @@ verify_install() {
         fi
     fi
 
-    return $all_good
+    return $errors
 }
 
 # Make muxm executable
@@ -333,7 +346,7 @@ main() {
     say "Installation plan:"
     echo "  • ffmpeg (video processing)"
     echo "  • ffprobe (media analysis)"
-    echo "  • MP4Box/gpac (fallback muxer)"
+    echo "  • MP4Box/gpac (optional fallback muxer)"
     if [[ "$INSTALL_GPU" == "1" ]] && [[ "$GPU_TYPE" != "none" ]]; then
         case "$GPU_TYPE" in
             nvidia) echo "  • NVIDIA drivers + NVENC support" ;;
