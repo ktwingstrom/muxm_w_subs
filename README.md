@@ -6,7 +6,7 @@ This is a simplified fork of [MuxMaster](https://github.com/theBluWiz/muxmaster)
 - **Video passthrough** for H.264/H.265 (no re-encoding)
 - **NVENC hardware encoding** for other codecs
 - **AAC audio** with stereo fallback
-- **English text subtitles** embedded as mov_text
+- **English text subtitles** as external SRT sidecar files
 - **Batch processing** with parallel workers
 
 ## Table of Contents
@@ -22,8 +22,8 @@ This is a simplified fork of [MuxMaster](https://github.com/theBluWiz/muxmaster)
 - **Video Passthrough** – H.264 and H.265 sources are copied without re-encoding
 - **NVENC Transcoding** – Other codecs (VP9, AV1, ProRes) transcoded via GPU
 - **AAC Audio** – All audio output as AAC (384k surround, 192k stereo fallback)
-- **Subtitle Extraction** – English text subtitles (SRT, ASS) embedded as mov_text
-- **Parallel Processing** – `muxm-batch` processes directories with multiple workers
+- **Subtitle Extraction** – English text subtitles extracted to external SRT sidecar files
+- **Parallel Processing** – `muxm-pipeline` processes directories with caching and parallel workers
 - **Auto Thread Detection** – Optimizes CPU usage automatically
 - **HDR Preservation** – Maintains HDR10/HLG metadata on passthrough
 - **Dry-Run Mode** – Test workflows without writing files
@@ -32,29 +32,39 @@ This is a simplified fork of [MuxMaster](https://github.com/theBluWiz/muxmaster)
 
 ## Installation <a id="installation"></a>
 
-### Dependencies
-
-```bash
-# Ubuntu/Debian
-sudo apt install ffmpeg gpac
-
-# For NVENC support, ensure nvidia drivers are installed
-# ffmpeg must be compiled with --enable-nvenc
-```
-
-### Install Script
+### Automated Install (Recommended)
 
 ```bash
 # Clone the repository
 git clone https://github.com/your-repo/muxmaster-fork.git
 cd muxmaster-fork
 
-# Make scripts executable
-chmod +x muxm muxm-batch
+# Run the installer
+./install.sh
+```
 
-# Optionally add to PATH
-sudo ln -s "$(pwd)/muxm" /usr/local/bin/muxm
-sudo ln -s "$(pwd)/muxm-batch" /usr/local/bin/muxm-batch
+The installer will:
+- Detect your OS (Ubuntu/Debian, Fedora/RHEL, Arch Linux)
+- Install ffmpeg, ffprobe, and optional dependencies
+- Detect your GPU and offer to install NVENC/VAAPI drivers
+- Optionally install scripts to `/usr/local/bin` for system-wide access
+
+### Manual Installation
+
+If you prefer manual setup:
+
+```bash
+# Ubuntu/Debian
+sudo apt install ffmpeg pciutils
+
+# For NVENC support, ensure NVIDIA drivers are installed
+# ffmpeg must be compiled with --enable-nvenc
+
+# Make scripts executable
+chmod +x muxm muxm-pipeline muxm-batch
+
+# Install to PATH (optional)
+sudo cp muxm muxm-pipeline muxm-batch /usr/local/bin/
 ```
 
 ## Usage <a id="usage"></a>
@@ -90,39 +100,66 @@ muxm --nvenc-preset p6 --nvenc-cq 20 input.mkv output.mp4
 
 ## Batch Processing <a id="batch"></a>
 
-Process entire directories with parallel workers:
+### muxm-pipeline (Recommended)
+
+High-performance batch processing with local caching, ideal for NFS sources:
+
+```bash
+# Process all videos in a directory
+muxm-pipeline /media/movies
+
+# Output to different location
+muxm-pipeline /media/source /media/converted
+
+# Custom worker count
+muxm-pipeline -w 4 /media/movies
+
+# With filebot renaming (movies)
+muxm-pipeline --filebot --filebot-db TheMovieDB /media/movies
+
+# With filebot renaming (TV shows)
+muxm-pipeline --filebot --filebot-db TheMovieDB::TV /media/tv
+
+# Delete originals after successful conversion (careful!)
+muxm-pipeline --delete-original /media/movies
+
+# Dry run to preview
+muxm-pipeline --dry-run /media/movies
+```
+
+### Pipeline Flags
+
+| Flag | Description |
+|------|-------------|
+| `-w, --workers N` | Parallel workers (default: 6) |
+| `-c, --cache-dir DIR` | Local cache location (default: /var/cache/muxm) |
+| `--cache-max-gb N` | Max cache size in GB (default: 1800) |
+| `--prefetch N` | Files to prefetch ahead (default: 3) |
+| `--format-tag` | Add codec info to filename (default: on) |
+| `--no-format-tag` | Keep original filename |
+| `--filebot` | Enable filebot renaming |
+| `--filebot-db DB` | Filebot database (TheMovieDB, TheMovieDB::TV) |
+| `--delete-original` | Delete source after success |
+| `--dry-run` | List files without processing |
+
+### muxm-batch (Legacy)
+
+Simple parallel batch wrapper without caching:
 
 ```bash
 # Process all videos in a directory (6 workers)
 muxm-batch /media/movies
 
-# Output to different location
-muxm-batch /media/source /media/converted
-
-# Custom worker count
-muxm-batch -w 4 /media/movies
-
-# Only process MKV files
-muxm-batch -e mkv /media/movies
-
-# Dry run to preview
-muxm-batch --dry-run /media/movies
-
 # Retry failed files
 muxm-batch --retry ./muxm-batch-logs/failed.txt
 ```
-
-### Batch Flags
 
 | Flag | Description |
 |------|-------------|
 | `-w, --workers N` | Parallel workers (default: 6) |
 | `-r, --recursive` | Process subdirectories (default: on) |
-| `-R, --no-recursive` | Only process top directory |
 | `-s, --skip-existing` | Skip if output exists (default: on) |
-| `-f, --force` | Overwrite existing outputs |
 | `-e, --extensions LIST` | File extensions (default: mkv,mp4,avi,...) |
-| `-l, --log-dir DIR` | Log directory |
 | `--retry FILE` | Retry from failed log |
 | `--dry-run` | List files without processing |
 
