@@ -8,7 +8,7 @@ This is a **simplified fork** of MuxMaster focused on fast remuxing with minimal
 
 - **Video**: Passthrough for H.264/H.265 (no re-encode); NVENC transcoding for other codecs
 - **Audio**: AAC output only (surround + stereo fallback)
-- **Subtitles**: Extract one English text subtitle as mov_text, strip all image-based
+- **Subtitles**: Extract one English text subtitle as external SRT sidecar, strip all image-based
 - **Output**: Always MP4 container
 - **Batch**: `muxm-batch` for parallel processing of large libraries
 
@@ -18,7 +18,7 @@ This is a **simplified fork** of MuxMaster focused on fast remuxing with minimal
 |---------|----------|-----------|
 | Video | Always x265 encode | Passthrough H.264/H.265, NVENC for others |
 | Audio | E-AC3/AC3/AAC | AAC only |
-| Subtitles | None | English text → mov_text |
+| Subtitles | None | English text → SRT sidecar |
 | Dolby Vision | Full support | Removed |
 | Batch processing | None | muxm-batch with parallel workers |
 
@@ -33,7 +33,7 @@ This is a **simplified fork** of MuxMaster focused on fast remuxing with minimal
 ### Single File Processing (muxm)
 
 ```bash
-# Basic usage (passthrough H.264/H.265, AAC audio, mov_text subs)
+# Basic usage (passthrough H.264/H.265, AAC audio, SRT sidecar subs)
 ./muxm input.mkv output.mp4
 
 # Dry run (simulate without writing)
@@ -102,8 +102,8 @@ This is a **simplified fork** of MuxMaster focused on fast remuxing with minimal
 **Subtitle Handling**:
 - Detects text-based (SRT, ASS, SSA, WebVTT) vs image-based (PGS, DVD)
 - Selects best English text subtitle (prefers non-forced)
-- Converts to mov_text for MP4 embedding
-- Strips all image-based subtitles
+- Outputs as external SRT sidecar file (e.g., `movie.srt` alongside `movie.mp4`)
+- Strips all image-based subtitles from output
 
 **Audio Strategy**:
 - AAC source → copy directly

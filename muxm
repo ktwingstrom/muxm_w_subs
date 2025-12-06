@@ -2,7 +2,7 @@
 # =============================================================================
 #  MuxMaster™ Freeware License v1.0
 #  Copyright © 2025 Jamey Wicklund (theBluWiz)
-#  Fork: Simplified Remux Tool (video passthrough, AAC audio, mov_text subs)
+#  Fork: Simplified Remux Tool (video passthrough, AAC audio, SRT sidecar subs)
 # =============================================================================
 # HLG/HDR10/SDR → MP4 Remuxer with NVENC fallback encoding
 # Requires: ffmpeg (with NVENC), ffprobe, MP4Box
@@ -768,6 +768,12 @@ on_exit() {
       note "DRY-RUN complete — no files were created."
     else
       [[ -f "$TMP_OUT" ]] && mv -f "$TMP_OUT" "$OUT"
+      # Copy SRT sidecar if present
+      if [[ -n "${SUB_SRT:-}" && -s "$SUB_SRT" ]]; then
+        local _srt_out="${OUT%.mp4}.srt"
+        cp -f "$SUB_SRT" "$_srt_out"
+        note "Subtitle sidecar: $_srt_out"
+      fi
       (( CHECKSUM )) && write_checksum "$OUT"
       note "Build SUCCEEDED."
     fi
@@ -1222,8 +1228,7 @@ V_ENCODED="$WORKDIR/video_encoded.mp4"
 V_FINAL=""  # Will be set to "passthrough" or path to encoded file
 A_PRIMARY=""
 AAC_STEREO=""
-SUB_MOV_TEXT=""
-SUB_SRT="$WORKDIR/subtitle.srt"
+SUB_SRT="$WORKDIR/subtitle.srt"  # External SRT sidecar (not embedded)
 MP4_BASE="$WORKDIR/primary_base.mp4"
 
 # ---------- Video Processing (Step [1/10]) ----------
@@ -1426,7 +1431,7 @@ else
     _sub_codec="$(_sp_subtitle_field "$SUB_IDX" codec_name)"
     _sub_lang="$(_sp_subtitle_tag "$SUB_IDX" language)"
     [[ -z "$_sub_lang" ]] && _sub_lang="eng"
-    note "Selected subtitle track #$SUB_IDX ($_sub_codec, $_sub_lang) for embedding."
+    note "Selected subtitle track #$SUB_IDX ($_sub_codec, $_sub_lang) for SRT sidecar."
 
     if (( DRY_RUN )); then
       say "DRY-RUN: Extract subtitle #$SUB_IDX → $SUB_SRT"
@@ -1434,7 +1439,6 @@ else
     else
       if convert_subtitle_to_srt "$SUB_IDX" "$SUB_SRT"; then
         if [[ -s "$SUB_SRT" ]]; then
-          SUB_MOV_TEXT="$SUB_SRT"
           HAS_SUBTITLE=1
           mark_done "Subtitle extracted"
         else
@@ -1449,7 +1453,7 @@ else
   fi
 fi
 
-# ---------- Primary MP4 Mux (video + primary audio + subtitle) (Step [7/10]) ----------
+# ---------- Primary MP4 Mux (video + primary audio) (Step [7/10]) ----------
 say "[7/10] Muxing primary MP4 → $MP4_BASE"
 
 # Determine video source for muxing
@@ -1463,34 +1467,21 @@ fi
 
 if (( DRY_RUN )); then
   say "DRY-RUN: ffmpeg mux → $MP4_BASE"
-  [[ -n "$SUB_MOV_TEXT" ]] && say "  (with subtitle from $SUB_MOV_TEXT)"
   : > "$MP4_BASE"
 else
-  # Use ffmpeg for muxing to handle passthrough + subtitle embedding cleanly
+  # Use ffmpeg for muxing video + audio (subtitles handled as external SRT sidecar)
   _mux_inputs=( -i "$V_MUX_SRC" )
   _mux_maps=( -map "$V_MUX_STREAM" )
   _mux_codec=( -c:v copy )
   _mux_meta=()
 
-  # Add audio if present
+  # Add audio if present (subtitles handled as external SRT sidecar in on_exit)
   if [[ -s "$A_PRIMARY" ]]; then
     _mux_inputs+=( -i "$A_PRIMARY" )
     _mux_maps+=( -map 1:a:0 )
     _mux_codec+=( -c:a copy )
     _mux_meta+=( -metadata:s:a:0 language="$A_LANG" )
     (( INCLUDE_AUDIO_TITLES )) && [[ -n "$A_TITLE" ]] && _mux_meta+=( -metadata:s:a:0 title="$A_TITLE" )
-    _sub_input_idx=2
-  else
-    _sub_input_idx=1
-  fi
-
-  # Add subtitle if present
-  if [[ -n "$SUB_MOV_TEXT" && -s "$SUB_MOV_TEXT" ]]; then
-    _mux_inputs+=( -i "$SUB_MOV_TEXT" )
-    _mux_maps+=( -map "${_sub_input_idx}:s:0" )
-    _mux_codec+=( -c:s mov_text )
-    _sub_lang="${_sub_lang:-eng}"
-    _mux_meta+=( -metadata:s:s:0 language="$_sub_lang" -metadata:s:s:0 title="English" )
   fi
 
   ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
