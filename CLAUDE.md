@@ -20,13 +20,27 @@ This is a **simplified fork** of MuxMaster focused on fast remuxing with minimal
 | Audio | E-AC3/AC3/AAC | AAC only |
 | Subtitles | None | English text → SRT sidecar |
 | Dolby Vision | Full support | Removed |
-| Batch processing | None | muxm-batch with parallel workers |
+| Batch processing | None | muxm-pipeline with caching + parallel workers |
 
-## Required Dependencies
+## Installation
+
+Run `./install.sh` to automatically install dependencies and optionally add scripts to PATH:
+
+```bash
+./install.sh
+```
+
+The installer handles:
+- OS detection (Ubuntu/Debian, Fedora/RHEL, Arch)
+- ffmpeg, ffprobe installation
+- GPU driver setup (NVIDIA NVENC, AMD/Intel VAAPI)
+- Optional installation to `/usr/local/bin`
+
+### Required Dependencies
 
 - `ffmpeg` (with NVENC support for GPU encoding)
 - `ffprobe` - Video/audio analysis
-- `MP4Box` (GPAC) - Not required for primary mux but kept for fallback
+- `MP4Box` (GPAC) - Optional fallback muxer
 
 ## Running the Tools
 
@@ -46,20 +60,33 @@ This is a **simplified fork** of MuxMaster focused on fast remuxing with minimal
 ./muxm --nvenc-preset p6 --nvenc-cq 20 input.mkv output.mp4
 ```
 
-### Batch Processing (muxm-batch)
+### Batch Processing (muxm-pipeline) - Recommended
 
 ```bash
-# Process entire directory (6 parallel workers default)
-./muxm-batch /media/movies
+# Process entire directory with caching
+./muxm-pipeline /media/movies
 
 # Process to different output location
-./muxm-batch /media/source /media/converted
+./muxm-pipeline /media/source /media/converted
 
-# Adjust worker count
-./muxm-batch -w 4 /media/movies
+# With filebot renaming (movies)
+./muxm-pipeline --filebot --filebot-db TheMovieDB /media/movies
+
+# With filebot renaming (TV shows)
+./muxm-pipeline --filebot --filebot-db TheMovieDB::TV /media/tv
+
+# Delete originals after success (careful!)
+./muxm-pipeline --delete-original /media/movies
 
 # Dry run to see what would be processed
-./muxm-batch --dry-run /media/movies
+./muxm-pipeline --dry-run /media/movies
+```
+
+### Batch Processing (muxm-batch) - Legacy
+
+```bash
+# Simple parallel processing without caching
+./muxm-batch /media/movies
 
 # Retry failed files
 ./muxm-batch --retry ./muxm-batch-logs/failed-20250101.txt
@@ -70,7 +97,8 @@ This is a **simplified fork** of MuxMaster focused on fast remuxing with minimal
 ### Scripts
 
 - `muxm` - Main processing script (single file)
-- `muxm-batch` - Parallel batch wrapper for directories
+- `muxm-pipeline` - Recommended batch processor with NFS caching and filebot integration
+- `muxm-batch` - Legacy parallel batch wrapper (simpler, no caching)
 
 ### Configuration Layering (lowest to highest precedence)
 

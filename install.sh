@@ -292,27 +292,68 @@ verify_install() {
     return $errors
 }
 
-# Make muxm executable
+# Make muxm executable and optionally install to PATH
 setup_muxm() {
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-    if [[ -f "$script_dir/muxm" ]]; then
-        chmod +x "$script_dir/muxm"
-        say "Made muxm executable"
+    if [[ ! -f "$script_dir/muxm" ]]; then
+        warn "muxm script not found in $script_dir"
+        return 1
+    fi
 
-        if [[ -f "$script_dir/muxm-pipeline" ]]; then
-            chmod +x "$script_dir/muxm-pipeline"
-            say "Made muxm-pipeline executable"
-        fi
+    # Make scripts executable
+    chmod +x "$script_dir/muxm"
+    say "Made muxm executable"
 
-        if [[ -f "$script_dir/muxm-batch" ]]; then
-            chmod +x "$script_dir/muxm-batch"
-            say "Made muxm-batch executable"
-        fi
+    if [[ -f "$script_dir/muxm-pipeline" ]]; then
+        chmod +x "$script_dir/muxm-pipeline"
+        say "Made muxm-pipeline executable"
+    fi
 
-        info "You can now run: $script_dir/muxm --help"
+    if [[ -f "$script_dir/muxm-batch" ]]; then
+        chmod +x "$script_dir/muxm-batch"
+        say "Made muxm-batch executable"
+    fi
+
+    # Ask about installing to PATH
+    echo ""
+    read -rp "Install muxm scripts to /usr/local/bin (requires sudo)? [Y/n] " install_choice
+    install_choice="${install_choice:-Y}"
+
+    if [[ "$install_choice" =~ ^[Yy] ]]; then
+        install_to_path "$script_dir"
+    else
+        info "Skipping PATH installation."
+        info "You can run directly: $script_dir/muxm --help"
         info "Or add to PATH: export PATH=\"\$PATH:$script_dir\""
+    fi
+}
+
+# Install scripts to /usr/local/bin
+install_to_path() {
+    local script_dir="$1"
+    local install_dir="/usr/local/bin"
+    local scripts=("muxm" "muxm-pipeline" "muxm-batch")
+
+    say "Installing scripts to $install_dir..."
+
+    for script in "${scripts[@]}"; do
+        if [[ -f "$script_dir/$script" ]]; then
+            if $SUDO cp "$script_dir/$script" "$install_dir/$script"; then
+                $SUDO chmod +x "$install_dir/$script"
+                say "Installed: $install_dir/$script"
+            else
+                err "Failed to install $script"
+            fi
+        fi
+    done
+
+    # Verify installation
+    if command -v muxm &>/dev/null; then
+        say "✓ muxm is now available in PATH"
+    else
+        warn "muxm not found in PATH - you may need to restart your shell"
     fi
 }
 
