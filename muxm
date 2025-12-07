@@ -5,7 +5,7 @@
 #  Fork: Simplified Remux Tool (video passthrough, AAC audio, SRT sidecar subs)
 # =============================================================================
 # HLG/HDR10/SDR → MP4 Remuxer with NVENC fallback encoding
-# Requires: ffmpeg (with NVENC), ffprobe, MP4Box
+# Requires: ffmpeg (with NVENC support), ffprobe
 # =============================================================================
 
 set -eEuo pipefail
@@ -74,6 +74,9 @@ ADD_STEREO_IF_MULTICH=1
 AAC_SURROUND_BITRATE_5_1="384k"
 AAC_SURROUND_BITRATE_7_1="448k"
 PARALLEL_AUDIO=0
+
+# Subtitle extraction
+SKIP_SUBS=0
 
 # Muxing / output
 OUTPUT_EXT="mp4"
@@ -229,9 +232,12 @@ Threads:
       --threads N                ffmpeg -threads N (auto-detected by default)
       --no-auto-threads          Disable auto-detection, let ffmpeg decide
 
-Video (x265):
-  -p, --preset NAME              ultrafast..placebo (default ${PRESET_VALUE})
-      --crf N                    Constant Rate Factor (default ${CRF_VALUE})
+Video (passthrough or encode):
+  H.264/H.265 sources are copied directly (passthrough). Other codecs (VP9, AV1,
+  ProRes, etc.) are transcoded to H.265 via NVENC or libx265.
+
+  -p, --preset NAME              libx265 preset: ultrafast..placebo (default ${PRESET_VALUE})
+      --crf N                    libx265 Constant Rate Factor (default ${CRF_VALUE})
       --x265-params STR          Full x265 param string (overrides base)
   -l, --level N                  x265 level-idc (e.g., 5.1)
       --no-conservative-vbv      Disable conservative VBV for set level
@@ -267,14 +273,17 @@ Audio transcode:
       --aac-surround-5-1 RATE    AAC 5.1 bitrate (default ${AAC_SURROUND_BITRATE_5_1})
       --aac-surround-7-1 RATE    AAC 7.1 bitrate (default ${AAC_SURROUND_BITRATE_7_1})
 
+Subtitles:
+  Extracts best English text subtitle as external SRT sidecar file.
+  Image-based subtitles (PGS, DVD) are stripped from output.
+
+      --no-subs                  Skip subtitle extraction entirely
+
 Mux / output:
       --output-ext EXT           mp4|m4v|mov (default ${OUTPUT_EXT})
-      --mp4-interleave-ms N      MP4Box -inter (default ${MP4_INTERLEAVE_MS})
       --tag-language-default L   Default tag lang if missing (default ${TAG_LANGUAGE_DEFAULT})
       --include-audio-titles     Include source title in MP4 (default on)
       --no-include-audio-titles  Do not include audio titles
-      --mp4box-quiet             MP4Box -quiet (default on)
-      --mp4box-verbose           Disable -quiet
 EOF
 }
 
@@ -423,6 +432,7 @@ while [[ $# -gt 0 ]]; do
     --no-stereo-fallback) ADD_STEREO_IF_MULTICH=0; shift ;;
     --aac-surround-5-1) AAC_SURROUND_BITRATE_5_1="${2:-}"; shift 2 ;;
     --aac-surround-7-1) AAC_SURROUND_BITRATE_7_1="${2:-}"; shift 2 ;;
+    --no-subs) SKIP_SUBS=1; shift ;;
 
     --output-ext) OUTPUT_EXT="${2:-}"; shift 2 ;;
     --mp4-interleave-ms) MP4_INTERLEAVE_MS="${2:-}"; shift 2 ;;
@@ -787,7 +797,7 @@ on_exit() {
       > "${OUT_DIR}/$(basename "${OUT}")${_suffix}.log" 2>/dev/null || true
 
     if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && $KEEP_TEMP_ALWAYS -eq 0 ]]; then
-      rm -rf "$WORKDIR"
+      rm -rf "$WORKDIR" 2>/dev/null || warn "Could not fully clean temp dir: $WORKDIR"
     else
       note "Keeping workdir: $WORKDIR"
     fi
@@ -801,7 +811,7 @@ on_exit() {
     fi
     echo "See log: $LOGFILE"
     if [[ -n "$WORKDIR" && -d "$WORKDIR" && "${DEBUG:-0}" != "1" && $KEEP_TEMP -eq 0 && $KEEP_TEMP_ALWAYS -eq 0 ]]; then
-      rm -rf "$WORKDIR"
+      rm -rf "$WORKDIR" 2>/dev/null || true
     else
       note "Keeping failure artifacts at: $WORKDIR"
     fi
@@ -1032,7 +1042,7 @@ _muxm_codec_rank(){
   local IFS=, pref i=0
   for pref in $AUDIO_CODEC_PREFERENCE; do
     if [[ "$codec" == "$pref" ]]; then echo "$i"; return; fi
-    ((i++))
+    ((++i))
   done
   echo "$i"
 }
@@ -1418,7 +1428,9 @@ SUB_COUNT="$(_subtitle_count)"
 SUB_IDX=""
 HAS_SUBTITLE=0
 
-if (( SUB_COUNT == 0 )); then
+if (( SKIP_SUBS )); then
+  note "Subtitle extraction disabled (--no-subs)."
+elif (( SUB_COUNT == 0 )); then
   note "No subtitle tracks found in source."
 else
   note "Found $SUB_COUNT subtitle track(s):"

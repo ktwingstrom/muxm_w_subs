@@ -18,8 +18,7 @@ CACHE_MAX_GB="${CACHE_MAX_GB:-1800}"         # Max cache usage in GB
 RECURSIVE="${RECURSIVE:-1}"
 FILE_EXTENSIONS="${FILE_EXTENSIONS:-mkv,mp4,avi,mov,m4v,ts,wmv,webm,flv}"
 
-# Naming
-ADD_FORMAT_TAG="${ADD_FORMAT_TAG:-1}"        # Add codec info to filename
+# Naming - always update codec tags to reflect actual output format
 
 # Safety
 DELETE_ORIGINAL="${DELETE_ORIGINAL:-0}"      # Set to 1 to enable (dangerous!)
@@ -78,8 +77,6 @@ Processing Options:
   -e, --extensions LIST Comma-separated extensions (default: mkv,mp4,...)
 
 Output Options:
-  --format-tag          Add format info to filename (default: on)
-  --no-format-tag       Keep original filename (just change extension)
   --delete-original     Delete source after successful conversion
   --no-delete-original  Keep source files (default, safe)
 
@@ -135,8 +132,6 @@ while [[ $# -gt 0 ]]; do
     -r|--recursive)     RECURSIVE=1; shift ;;
     -R|--no-recursive)  RECURSIVE=0; shift ;;
     -e|--extensions)    FILE_EXTENSIONS="${2:-}"; shift 2 ;;
-    --format-tag)       ADD_FORMAT_TAG=1; shift ;;
-    --no-format-tag)    ADD_FORMAT_TAG=0; shift ;;
     --delete-original)  DELETE_ORIGINAL=1; shift ;;
     --no-delete-original) DELETE_ORIGINAL=0; shift ;;
     --verify)           VERIFY_OUTPUT=1; shift ;;
@@ -166,7 +161,11 @@ done
 # Validate
 [[ -z "$INPUT_DIR" ]] && { print_usage; die "INPUT_DIR is required"; }
 [[ ! -d "$INPUT_DIR" ]] && die "INPUT_DIR does not exist: $INPUT_DIR"
+
+# Convert to absolute paths to avoid issues with filenames containing special chars
+INPUT_DIR="$(cd "$INPUT_DIR" && pwd)"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$INPUT_DIR"
+[[ -d "$OUTPUT_DIR" ]] && OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 # Update cache paths
 CACHE_INPUT="$CACHE_DIR/input"
@@ -330,70 +329,105 @@ cleanup_cache_file() {
 
 # ---------- File Discovery ----------
 build_file_list() {
-  local find_cmd="find \"$INPUT_DIR\""
-  (( RECURSIVE == 0 )) && find_cmd+=" -maxdepth 1"
-  find_cmd+=" -type f \\("
+  local -a find_args=("$INPUT_DIR")
+  (( RECURSIVE == 0 )) && find_args+=(-maxdepth 1)
+  find_args+=(-type f \()
 
   local first=1
   IFS=',' read -ra exts <<< "$FILE_EXTENSIONS"
   for ext in "${exts[@]}"; do
     ext="$(echo "$ext" | tr -d '[:space:]')"
-    (( first )) && first=0 || find_cmd+=" -o"
-    find_cmd+=" -iname \"*.$ext\""
+    (( first )) && first=0 || find_args+=(-o)
+    find_args+=(-iname "*.$ext")
   done
-  find_cmd+=" \\)"
+  find_args+=(\))
 
-  eval "$find_cmd" 2>/dev/null | sort
+  # Use find directly (no eval) with proper quoting
+  find "${find_args[@]}" 2>/dev/null | sort
 }
 
-# ---------- Format Tag Generation ----------
-get_format_tag() {
+# ---------- Format-Aware Renaming ----------
+# Keeps original filename structure but updates codec tags to reflect actual output.
+# Example: Tick.Tick.Boom.2021.iTA-ENG.Bluray.1080p.x264-CYBER.mkv
+#       -> Tick.Tick.Boom.2021.iTA-ENG.Bluray.1080p.x264.AAC.5.1-CYBER.mp4
+
+# Get actual output format info by probing the source file
+get_output_format_info() {
   local file="$1"
-  local vcodec acodec channels resolution
+  local vcodec achannels
 
-  # Video codec
+  # Video codec from source (determines passthrough vs transcode)
   vcodec=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_name \
-           -of default=nk=1:nw=1 "$file" 2>/dev/null | head -1 | tr '[:lower:]' '[:upper:]')
+           -of default=nk=1:nw=1 "$file" 2>/dev/null | head -1 | tr '[:upper:]' '[:lower:]')
+
+  # Determine output video codec tag
   case "$vcodec" in
-    H264|AVC)  vcodec="H264" ;;
-    HEVC|H265) vcodec="H265" ;;
-    *)         vcodec="H265" ;;  # We transcode to H265
+    h264|avc|avc1)  OUT_VCODEC_TAG="x264" ;;
+    hevc|h265)      OUT_VCODEC_TAG="x265" ;;
+    *)              OUT_VCODEC_TAG="x265" ;;  # Non-passthrough codecs get transcoded to H.265
   esac
 
-  # Audio codec (will be AAC after processing)
-  acodec="AAC"
+  # Audio channels from source (output will be AAC with same channel count, capped at 8)
+  achannels=$(ffprobe -v quiet -select_streams a:0 -show_entries stream=channels \
+              -of default=nk=1:nw=1 "$file" 2>/dev/null | head -1)
+  [[ -z "$achannels" ]] && achannels=2
 
-  # Channels
-  channels=$(ffprobe -v quiet -select_streams a:0 -show_entries stream=channels \
-             -of default=nk=1:nw=1 "$file" 2>/dev/null | head -1)
-  case "$channels" in
-    8) channels="71" ;;
-    6) channels="51" ;;
-    2) channels="Stereo" ;;
-    *) channels="Stereo" ;;
+  # Determine audio format tag
+  case "$achannels" in
+    8)       OUT_ACODEC_TAG="AAC.7.1" ;;
+    6)       OUT_ACODEC_TAG="AAC.5.1" ;;
+    2|1)     OUT_ACODEC_TAG="AAC" ;;
+    *)       OUT_ACODEC_TAG="AAC.5.1" ;;  # Default to 5.1 for other multichannel
   esac
+}
 
-  # Resolution
-  local height
-  height=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=height \
-           -of default=nk=1:nw=1 "$file" 2>/dev/null | head -1)
-  if [[ "$height" =~ ^[0-9]+$ ]]; then
-    if (( height >= 2000 )); then
-      resolution="2160p"
-    elif (( height >= 1000 )); then
-      resolution="1080p"
-    elif (( height >= 700 )); then
-      resolution="720p"
-    else
-      resolution="SD"
-    fi
+# Extract release group from filename (text after last hyphen before extension)
+extract_release_group() {
+  local name="$1"
+  # Match -GROUP at end, where GROUP is alphanumeric (possibly with underscores)
+  if [[ "$name" =~ -([A-Za-z0-9_]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
   else
-    resolution=""
+    echo ""
   fi
+}
 
-  # Build tag
-  local tag="${resolution:+$resolution.}${vcodec}.${acodec}${channels}"
-  echo "$tag"
+# Remove release group suffix from name
+strip_release_group() {
+  local name="$1"
+  local group="$2"
+  if [[ -n "$group" ]]; then
+    echo "${name%-$group}"
+  else
+    echo "$name"
+  fi
+}
+
+# Remove existing audio codec tags from filename
+strip_audio_codec_tags() {
+  local name="$1"
+  # Remove common audio codec patterns (case insensitive)
+  # Patterns: DTS-HD.MA, DTS-HD, DTS, TrueHD, Atmos, DD5.1, DD+, EAC3, AC3, AAC, FLAC, etc.
+  name=$(echo "$name" | sed -E 's/[._-]?(DTS-HD\.?MA|DTS-HD|DTS|TrueHD|Atmos|DD\+?5\.1|DD\+|EAC3|E-AC-3|AC3|AAC\.?[0-9.]*|FLAC|LPCM|PCM)([._-]|$)/\2/gi')
+  # Clean up any double dots/dashes left behind
+  name=$(echo "$name" | sed -E 's/[._-]{2,}/./g' | sed -E 's/[._-]$//')
+  echo "$name"
+}
+
+# Remove existing video codec tags from filename (only if we need to change them)
+strip_video_codec_tags() {
+  local name="$1"
+  # Remove common video codec patterns
+  name=$(echo "$name" | sed -E 's/[._-]?(x264|x265|h\.?264|h\.?265|HEVC|AVC|XviD|DivX|VP9|AV1)([._-]|$)/\2/gi')
+  # Clean up any double dots/dashes left behind
+  name=$(echo "$name" | sed -E 's/[._-]{2,}/./g' | sed -E 's/[._-]$//')
+  echo "$name"
+}
+
+# Check if filename already has a video codec tag
+has_video_codec_tag() {
+  local name="$1"
+  [[ "$name" =~ [._-](x264|x265|h\.?264|h\.?265|HEVC|AVC|XviD|DivX|VP9|AV1)[._-]? ]]
 }
 
 generate_output_name() {
@@ -401,16 +435,54 @@ generate_output_name() {
   local basename="${src_path##*/}"
   local name_no_ext="${basename%.*}"
 
-  if (( ADD_FORMAT_TAG )); then
-    local tag
-    tag=$(get_format_tag "$src_path")
-    # Remove existing format tags (common patterns)
-    name_no_ext=$(echo "$name_no_ext" | sed -E 's/\.(x264|x265|h264|h265|hevc|avc|aac|ac3|dts|truehd|atmos|51|71|stereo|1080p|720p|2160p|4k)+//gi')
-    name_no_ext=$(echo "$name_no_ext" | sed -E 's/\.+$//')  # Remove trailing dots
-    echo "${name_no_ext}.${tag}.mp4"
-  else
-    echo "${name_no_ext}.mp4"
+  # Get output format info
+  get_output_format_info "$src_path"
+
+  # Extract and temporarily remove release group
+  local release_group
+  release_group=$(extract_release_group "$name_no_ext")
+  local name_work
+  name_work=$(strip_release_group "$name_no_ext" "$release_group")
+
+  # Strip existing audio codec tags
+  name_work=$(strip_audio_codec_tags "$name_work")
+
+  # Check source video codec to see if we need to update video tag
+  local src_vcodec
+  src_vcodec=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_name \
+               -of default=nk=1:nw=1 "$src_path" 2>/dev/null | head -1 | tr '[:upper:]' '[:lower:]')
+
+  # Determine if video codec tag needs updating
+  local needs_video_update=0
+  case "$src_vcodec" in
+    h264|avc|avc1|hevc|h265)
+      # Passthrough - keep existing tag if present, or don't add
+      needs_video_update=0
+      ;;
+    *)
+      # Transcoding to H.265 - need to update/add video tag
+      needs_video_update=1
+      ;;
+  esac
+
+  # If transcoding, strip old video tag and add new one
+  if (( needs_video_update )); then
+    name_work=$(strip_video_codec_tags "$name_work")
+    name_work="${name_work}.${OUT_VCODEC_TAG}"
   fi
+
+  # Add audio codec tag
+  name_work="${name_work}.${OUT_ACODEC_TAG}"
+
+  # Re-add release group if present
+  if [[ -n "$release_group" ]]; then
+    name_work="${name_work}-${release_group}"
+  fi
+
+  # Clean up any formatting issues
+  name_work=$(echo "$name_work" | sed -E 's/[._-]{2,}/./g')
+
+  echo "${name_work}.mp4"
 }
 
 # ---------- Single File Processing ----------
@@ -518,7 +590,6 @@ say "Cache:       $CACHE_DIR"
 say "Max Cache:   ${CACHE_MAX_GB}GB"
 say "Workers:     $MAX_WORKERS"
 say "Prefetch:    $PREFETCH_COUNT"
-say "Format Tag:  $(( ADD_FORMAT_TAG )) "
 say "Delete Orig: $(( DELETE_ORIGINAL )) ($(( DELETE_ORIGINAL )) && echo 'ENABLED!' || echo 'disabled')"
 if (( USE_FILEBOT )); then
   say "Filebot:     ENABLED (db=$FILEBOT_DB)"
@@ -571,32 +642,95 @@ if (( DRY_RUN )); then
   exit 0
 fi
 
-# Process files
+# Process files with parallel workers
 PROCESSED=0
 SUCCEEDED=0
 FAILED=0
 
-# Simple sequential processing for now (parallel prefetch can be added later)
+# Temp files for tracking results across subshells
+RESULT_DIR=$(mktemp -d)
+trap 'rm -rf "$RESULT_DIR"' EXIT
+
+# Worker function - runs in background
+process_worker() {
+  local src_file="$1"
+  local worker_id="$2"
+  local result_file="$RESULT_DIR/result_$worker_id"
+
+  local rel_path="${src_file#$INPUT_DIR/}"
+  local log_file="$LOG_DIR/$(echo "$rel_path" | tr '/' '_' | tr ' ' '_').log"
+
+  say "[Worker $worker_id] Processing: $rel_path"
+
+  if process_single_file "$src_file" "$OUTPUT_DIR" "$log_file"; then
+    echo "SUCCESS:$src_file" > "$result_file"
+    note "[Worker $worker_id] SUCCESS: ${rel_path##*/}"
+  else
+    echo "FAILED:$src_file" > "$result_file"
+    warn "[Worker $worker_id] FAILED: ${rel_path##*/} (see $log_file)"
+  fi
+}
+
+# Parallel processing with job control
+say "Starting $MAX_WORKERS parallel workers..."
+echo ""
+
+declare -a PIDS=()
+declare -a FILES=()
+WORKER_ID=0
+
 while IFS= read -r src_file; do
   [[ -z "$src_file" ]] && continue
 
-  ((PROCESSED++)) || true
-  rel_path="${src_file#$INPUT_DIR/}"
-  say "[$PROCESSED/$TOTAL_FILES] Processing: $rel_path"
-
-  log_file="$LOG_DIR/$(echo "$rel_path" | tr '/' '_' | tr ' ' '_').log"
-
-  if process_single_file "$src_file" "$OUTPUT_DIR" "$log_file"; then
-    ((SUCCEEDED++)) || true
-    echo "$src_file" >> "$SUCCESS_LOG"
-    note "  -> SUCCESS"
-  else
-    ((FAILED++)) || true
-    echo "$src_file" >> "$FAILED_LOG"
-    warn "  -> FAILED (see $log_file)"
+  # Verify file exists before queuing
+  if [[ ! -f "$src_file" ]]; then
+    warn "File not found, skipping: $src_file"
+    continue
   fi
 
+  ((WORKER_ID++)) || true
+  FILES+=("$src_file")
+
+  # Launch worker in background
+  process_worker "$src_file" "$WORKER_ID" &
+  PIDS+=($!)
+  ((PROCESSED++)) || true
+
+  # If we've reached max workers, wait for one to finish
+  while (( ${#PIDS[@]} >= MAX_WORKERS )); do
+    # Wait for any job to finish
+    for i in "${!PIDS[@]}"; do
+      if ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
+        wait "${PIDS[$i]}" 2>/dev/null || true
+        unset 'PIDS[i]'
+      fi
+    done
+    # Compact the array
+    PIDS=("${PIDS[@]}")
+    # Small sleep to avoid busy-waiting
+    (( ${#PIDS[@]} >= MAX_WORKERS )) && sleep 0.5
+  done
+
 done <<< "$FILE_LIST"
+
+# Wait for remaining workers
+say "Waiting for remaining workers to complete..."
+for pid in "${PIDS[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done
+
+# Collect results
+for result_file in "$RESULT_DIR"/result_*; do
+  [[ -f "$result_file" ]] || continue
+  result=$(cat "$result_file")
+  if [[ "$result" == SUCCESS:* ]]; then
+    ((SUCCEEDED++)) || true
+    echo "${result#SUCCESS:}" >> "$SUCCESS_LOG"
+  else
+    ((FAILED++)) || true
+    echo "${result#FAILED:}" >> "$FAILED_LOG"
+  fi
+done
 
 # Summary
 echo ""
