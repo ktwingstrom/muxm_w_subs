@@ -1006,6 +1006,7 @@ process_single_file() {
   local dst_nfs_dir="$2"
   local log_file="$3"
   local worker_id="${4:-0}"
+  local job_start_time=$(date +%s)
 
   local basename="${src_nfs##*/}"
   local rel_path="${src_nfs#$INPUT_DIR/}"
@@ -1016,6 +1017,22 @@ process_single_file() {
   local dst_name=$(generate_output_name "$src_nfs")
   local dst_cached="$CACHE_OUTPUT/$dst_name"
   local dst_final="$dst_nfs_dir${rel_dir:+/$rel_dir}/$dst_name"
+
+  # Check for existing SRT sidecar in source directory
+  local src_dir="${src_nfs%/*}"
+  local src_name_no_ext="${basename%.*}"
+  local existing_srt=""
+  local skip_subs_flag=""
+
+  # Look for any SRT matching: Movie.srt or Movie.*.srt (case insensitive)
+  shopt -s nullglob nocaseglob
+  local srt_matches=("$src_dir/$src_name_no_ext".srt "$src_dir/$src_name_no_ext".*.srt)
+  shopt -u nullglob nocaseglob
+  if (( ${#srt_matches[@]} > 0 )); then
+    existing_srt="${srt_matches[0]}"
+    skip_subs_flag="--no-subs"
+    echo "Found existing SRT: $existing_srt (will skip subtitle extraction)" >> "$log_file"
+  fi
 
   # Get file size for cache management
   local file_size_gb
@@ -1061,9 +1078,9 @@ process_single_file() {
 
   # Process
   update_worker_status "$worker_id" "ENCODING" "$basename" "Processing with muxm..." 15
-  echo "Processing with muxm..." >> "$log_file"
+  echo "Processing with muxm${skip_subs_flag:+ (skipping subs - existing SRT found)}..." >> "$log_file"
   export TMPDIR="$CACHE_TEMP"
-  if ! "$MUXM_BIN" "$src_cached" "$dst_cached" >> "$log_file" 2>&1; then
+  if ! "$MUXM_BIN" $skip_subs_flag "$src_cached" "$dst_cached" >> "$log_file" 2>&1; then
     echo "FAIL: muxm processing failed" >> "$log_file"
     cleanup_cache_file "$basename" "$dst_name"
     return 1
@@ -1092,10 +1109,17 @@ process_single_file() {
     return 1
   fi
 
-  # Also move SRT sidecar if it exists
+  # Handle SRT sidecar: use existing SRT from source, or move muxm-created one
   local srt_cached="${dst_cached%.mp4}.srt"
   local srt_final="${dst_final%.mp4}.srt"
-  if [[ -f "$srt_cached" ]]; then
+  if [[ -n "$existing_srt" && -f "$existing_srt" ]]; then
+    # Copy existing SRT from source directory
+    echo "Copying existing SRT: $existing_srt -> $srt_final" >> "$log_file"
+    cp "$existing_srt" "$srt_final" 2>> "$log_file" || warn "Could not copy existing SRT sidecar"
+    # Clean up any muxm-created SRT in cache (shouldn't exist with --no-subs but be safe)
+    rm -f "$srt_cached" 2>/dev/null || true
+  elif [[ -f "$srt_cached" ]]; then
+    # Move muxm-created SRT sidecar
     echo "Moving SRT sidecar: $srt_final" >> "$log_file"
     mv "$srt_cached" "$srt_final" 2>> "$log_file" || warn "Could not move SRT sidecar"
   fi
@@ -1212,7 +1236,7 @@ FAILED=0
 
 # Temp files for tracking results across subshells
 RESULT_DIR=$(mktemp -d)
-trap 'cleanup_status_dir; rm -rf "$RESULT_DIR"; (( MONITOR_UI )) && show_cursor' EXIT
+trap 'cleanup_status_dir; rm -rf "$RESULT_DIR"; rm -rf "$CACHE_TEMP"/* 2>/dev/null || true; (( MONITOR_UI )) && show_cursor' EXIT
 
 # Start monitor UI if enabled
 MONITOR_PID=""
@@ -1225,7 +1249,7 @@ fi
 process_worker() {
   local src_file="$1"
   local worker_id="$2"
-  local result_file="$RESULT_DIR/result_$worker_id"
+  local result_file="$RESULT_DIR/result_$(date +%s%N)_$worker_id"
 
   local rel_path="${src_file#$INPUT_DIR/}"
   local basename="${src_file##*/}"
@@ -1234,26 +1258,29 @@ process_worker() {
   (( MONITOR_UI )) || say "[Worker $worker_id] Processing: $rel_path"
   update_worker_status "$worker_id" "VERIFY" "$basename" "Checking..." 0
 
+  local job_start=$(date +%s)
   process_single_file "$src_file" "$OUTPUT_DIR" "$log_file" "$worker_id"
   local ret=$?
+  local job_end=$(date +%s)
+  local job_duration=$((job_end - job_start))
 
   case $ret in
     0)  # Success
-      echo "SUCCESS:$src_file" > "$result_file"
+      echo "SUCCESS:$job_duration:$src_file" > "$result_file"
       increment_completed
       add_recent "success" "$basename"
       clear_worker_status "$worker_id"
-      (( MONITOR_UI )) || note "[Worker $worker_id] SUCCESS: ${rel_path##*/}"
+      (( MONITOR_UI )) || note "[Worker $worker_id] SUCCESS: ${rel_path##*/} (${job_duration}s)"
       ;;
     2)  # Skipped (already processed)
-      echo "SKIPPED:$src_file" > "$result_file"
+      echo "SKIPPED:$job_duration:$src_file" > "$result_file"
       increment_skipped
       add_recent "skipped" "$basename"
       clear_worker_status "$worker_id"
-      (( MONITOR_UI )) || note "[Worker $worker_id] SKIPPED: ${rel_path##*/} (already processed)"
+      (( MONITOR_UI )) || note "[Worker $worker_id] SKIPPED: ${rel_path##*/} (already processed, ${job_duration}s)"
       ;;
     *)  # Failed
-      echo "FAILED:$src_file" > "$result_file"
+      echo "FAILED:$job_duration:$src_file" > "$result_file"
       increment_failed
       add_recent "failed" "$basename"
       clear_worker_status "$worker_id"
@@ -1326,34 +1353,95 @@ if (( MONITOR_UI )) && [[ -n "$MONITOR_PID" ]]; then
   clear_screen
 fi
 
-# Collect results
+# Collect results and timing data
 SKIPPED=0
+declare -a JOB_TIMINGS=()
+
 for result_file in "$RESULT_DIR"/result_*; do
   [[ -f "$result_file" ]] || continue
   result=$(cat "$result_file")
-  case "$result" in
-    SUCCESS:*)
+  # Format: STATUS:DURATION:FILEPATH
+  IFS=':' read -r status duration filepath <<< "$result"
+  local_basename="${filepath##*/}"
+
+  case "$status" in
+    SUCCESS)
       ((SUCCEEDED++)) || true
-      echo "${result#SUCCESS:}" >> "$SUCCESS_LOG"
+      echo "$filepath" >> "$SUCCESS_LOG"
+      JOB_TIMINGS+=("$(format_duration $duration)|$local_basename|SUCCESS")
       ;;
-    SKIPPED:*)
+    SKIPPED)
       ((SKIPPED++)) || true
+      JOB_TIMINGS+=("$(format_duration $duration)|$local_basename|SKIPPED")
       ;;
-    *)
+    FAILED)
       ((FAILED++)) || true
-      echo "${result#FAILED:}" >> "$FAILED_LOG"
+      echo "$filepath" >> "$FAILED_LOG"
+      JOB_TIMINGS+=("$(format_duration $duration)|$local_basename|FAILED")
       ;;
   esac
 done
 
+# Calculate total time
+END_TIME=$(date +%s)
+TOTAL_ELAPSED=$((END_TIME - START_TIME))
+
+# Clean up temp directories
+if [[ -d "$CACHE_TEMP" ]]; then
+  rm -rf "$CACHE_TEMP"/* 2>/dev/null || true
+fi
+
 # Summary
 echo ""
 say "=== Complete ==="
-note "Processed: $PROCESSED"
-note "Succeeded: $SUCCEEDED"
-(( SKIPPED > 0 )) && note "Skipped:   $SKIPPED (already processed)"
-note "Failed:    $FAILED"
-note "Logs:      $LOG_DIR"
+note "Total time:  $(format_duration $TOTAL_ELAPSED)"
+note "Processed:   $PROCESSED"
+note "Succeeded:   $SUCCEEDED"
+(( SKIPPED > 0 )) && note "Skipped:     $SKIPPED (already processed)"
+note "Failed:      $FAILED"
+note "Logs:        $LOG_DIR"
+
+# Job timing summary
+if (( ${#JOB_TIMINGS[@]} > 0 )); then
+  echo ""
+  say "=== Job Timings ==="
+  printf "%-12s %-8s %s\n" "Duration" "Status" "File"
+  printf "%-12s %-8s %s\n" "--------" "------" "----"
+
+  # Sort by duration (descending) and display
+  for timing in "${JOB_TIMINGS[@]}"; do
+    IFS='|' read -r dur name stat <<< "$timing"
+    case "$stat" in
+      SUCCESS) stat_color="${GREEN}✓${NC}" ;;
+      SKIPPED) stat_color="${YELLOW}○${NC}" ;;
+      FAILED)  stat_color="${RED}✗${NC}" ;;
+      *)       stat_color="$stat" ;;
+    esac
+    # Truncate long filenames
+    (( ${#name} > 60 )) && name="${name:0:57}..."
+    printf "%-12s %b %-6s %s\n" "$dur" "$stat_color" "" "$name"
+  done
+
+  # Calculate average time for successful jobs
+  total_success_time=0
+  success_count=0
+  for timing in "${JOB_TIMINGS[@]}"; do
+    IFS='|' read -r dur name stat <<< "$timing"
+    if [[ "$stat" == "SUCCESS" ]]; then
+      # Parse duration back to seconds (HH:MM:SS)
+      IFS=':' read -r h m s <<< "$dur"
+      secs=$((10#$h * 3600 + 10#$m * 60 + 10#$s))
+      ((total_success_time += secs)) || true
+      ((success_count++)) || true
+    fi
+  done
+
+  if (( success_count > 0 )); then
+    avg_time=$((total_success_time / success_count))
+    echo ""
+    note "Average job time: $(format_duration $avg_time)"
+  fi
+fi
 
 if [[ -s "$FAILED_LOG" ]]; then
   warn "Some files failed. Check logs in $LOG_DIR"
