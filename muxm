@@ -733,7 +733,16 @@ if [[ -z ${OUT-} ]]; then
   OUT="${base}.${OUTPUT_EXT}"
 fi
 OUT_DIR="$(dirname -- "$OUT")"
-OUT_DIR="$(cd -- "$OUT_DIR" 2>/dev/null && pwd || echo "$OUT_DIR")"
+# Ensure OUT_DIR is always absolute (critical for temp dir cleanup)
+# First try cd+pwd, then fall back to realpath, then construct from PWD
+if [[ -d "$OUT_DIR" ]]; then
+  OUT_DIR="$(cd -- "$OUT_DIR" && pwd)"
+elif command -v realpath >/dev/null 2>&1; then
+  OUT_DIR="$(realpath -m -- "$OUT_DIR")"
+else
+  # Manual fallback: prepend PWD if relative
+  [[ "$OUT_DIR" != /* ]] && OUT_DIR="$PWD/$OUT_DIR"
+fi
 OUT_BASENAME="$(basename -- "$OUT")"
 OUT_ABS="${OUT_DIR}/${OUT_BASENAME}"
 OUT="$OUT_ABS"
@@ -747,9 +756,10 @@ FFMPEG_FLAGS+=(-loglevel "$FFMPEG_LOGLEVEL")
 FFPROBE_FLAGS=(-v "$FFPROBE_LOGLEVEL")
 
 # ---------- Workdir ----------
-WORKDIR="$(
-  TMPDIR="$OUT_DIR" mktemp -d ".muxm.tmp.XXXXXXXX"
-)" || die 11 "Cannot create working directory under: $OUT_DIR"
+WORKDIR="$(mktemp -d "$OUT_DIR/.muxm.tmp.XXXXXXXX")" \
+  || die 11 "Cannot create working directory under: $OUT_DIR"
+# Ensure WORKDIR is absolute (critical for cleanup in EXIT trap)
+[[ "$WORKDIR" != /* ]] && WORKDIR="$PWD/$WORKDIR"
 LOGFILE="$WORKDIR/muxm.$(date +%Y%m%d-%H%M%S).log"
 
 # ---------- Begin logging to file (tee) ----------
